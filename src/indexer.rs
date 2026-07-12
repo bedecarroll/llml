@@ -1,0 +1,1979 @@
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::SystemTime;
+
+use color_eyre::Result;
+use color_eyre::eyre::{self, Context, eyre};
+use itertools::Itertools;
+use serde_json::Value;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use walkdir::WalkDir;
+
+use crate::config::model::{Config, ProviderConfig};
+use crate::db::{Database, IndexedSession};
+use crate::session::{
+    MessageRecord, SessionIngest, SessionSummary, TokenUsageRecord, fallback_session_uuid,
+    is_subagent_job_session_texts, session_meta_source_is_subagent, session_uuid_from_value,
+    thread_name_update_from_value,
+};
+
+#[derive(Debug, Default)]
+pub struct IndexReport {
+    pub scanned: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub removed: usize,
+    pub errors: Vec<IndexError>,
+}
+
+#[derive(Debug)]
+pub struct IndexError {
+    pub path: PathBuf,
+    pub error: eyre::Report,
+}
+
+pub struct Indexer<'a> {
+    db: &'a mut Database,
+    config: &'a Config,
+}
+
+enum FileProcess {
+    Updated(Box<SessionSummary>),
+    Skipped(String),
+}
+
+struct SessionFile {
+    path: PathBuf,
+    canonical_path: PathBuf,
+    size: i64,
+    mtime: i64,
+    created_at: Option<i64>,
+}
+
+fn indexed_session(summary: &SessionSummary) -> IndexedSession {
+    IndexedSession {
+        id: summary.id.clone(),
+        path: summary.path.clone(),
+        size: summary.size,
+        mtime: summary.mtime,
+    }
+}
+
+fn canonical_entry_path(root: &Path, canonical_root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root).map_or_else(
+        |_| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+        |relative| canonical_root.join(relative),
+    )
+}
+
+fn read_session_file(path: PathBuf, canonical_path: PathBuf) -> Result<SessionFile> {
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+    let mtime = system_time_to_unix(metadata.modified().ok()).unwrap_or_else(current_unix_time);
+    let created_at = system_time_to_unix(metadata.created().ok());
+
+    Ok(SessionFile {
+        path,
+        canonical_path,
+        size,
+        mtime,
+        created_at,
+    })
+}
+
+fn read_session_files(paths: Vec<(PathBuf, PathBuf)>) -> Vec<(PathBuf, Result<SessionFile>)> {
+    if paths.len() < 2 {
+        return paths
+            .into_iter()
+            .map(|(path, canonical_path)| {
+                let result = read_session_file(path.clone(), canonical_path);
+                (path, result)
+            })
+            .collect();
+    }
+
+    let workers = thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(8)
+        .min(paths.len());
+    let chunk_size = paths.len().div_ceil(workers);
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in paths.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            handles.push(scope.spawn(move || {
+                chunk
+                    .into_iter()
+                    .map(|(path, canonical_path)| {
+                        let result = read_session_file(path.clone(), canonical_path);
+                        (path, result)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("metadata worker panicked"))
+            .collect()
+    })
+}
+
+impl<'a> Indexer<'a> {
+    pub fn new(db: &'a mut Database, config: &'a Config) -> Self {
+        Self { db, config }
+    }
+
+    /// Re-scan configured session roots and update the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if walking the filesystem or updating the database fails.
+    pub fn run(&mut self) -> Result<IndexReport> {
+        let mut report = IndexReport::default();
+
+        for provider in self.config.providers.values() {
+            let existing_sessions = self.db.indexed_sessions_for_provider(&provider.name)?;
+            let mut existing_by_path: HashMap<String, IndexedSession> = existing_sessions
+                .iter()
+                .map(|session| (session.path.to_string_lossy().to_string(), session.clone()))
+                .collect();
+            let mut seen = HashSet::new();
+            for root in &provider.session_roots {
+                if !root.exists() {
+                    tracing::debug!(provider = %provider.name, root = %root.display(), "session root missing");
+                    continue;
+                }
+                if root.is_file() {
+                    if is_jsonl(root) {
+                        let canonical_path = root.canonicalize().unwrap_or_else(|_| root.clone());
+                        let file = read_session_file(root.clone(), canonical_path);
+                        match file
+                            .and_then(|file| self.process_file(provider, &file, &existing_by_path))
+                        {
+                            Ok(FileProcess::Updated(summary)) => {
+                                seen.insert(summary.id.clone());
+                                existing_by_path.insert(
+                                    summary.path.to_string_lossy().to_string(),
+                                    indexed_session(&summary),
+                                );
+                                report.updated += 1;
+                                report.scanned += 1;
+                            }
+                            Ok(FileProcess::Skipped(id)) => {
+                                seen.insert(id);
+                                report.skipped += 1;
+                            }
+                            Err(err) => {
+                                report.errors.push(IndexError {
+                                    path: root.clone(),
+                                    error: err,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                let mut paths = Vec::new();
+                for entry in WalkDir::new(root)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_map(std::result::Result::ok)
+                    .filter(|e| e.file_type().is_file())
+                {
+                    let path = entry.path();
+                    if !is_jsonl(path) {
+                        continue;
+                    }
+
+                    let canonical_path = canonical_entry_path(root, &canonical_root, path);
+                    paths.push((path.to_path_buf(), canonical_path));
+                }
+
+                report.scanned += paths.len();
+                for (path, file) in read_session_files(paths) {
+                    match file
+                        .and_then(|file| self.process_file(provider, &file, &existing_by_path))
+                    {
+                        Ok(FileProcess::Updated(summary)) => {
+                            seen.insert(summary.id.clone());
+                            existing_by_path.insert(
+                                summary.path.to_string_lossy().to_string(),
+                                indexed_session(&summary),
+                            );
+                            report.updated += 1;
+                        }
+                        Ok(FileProcess::Skipped(id)) => {
+                            seen.insert(id);
+                            report.skipped += 1;
+                        }
+                        Err(err) => {
+                            report.errors.push(IndexError { path, error: err });
+                        }
+                    }
+                }
+            }
+
+            // remove stale sessions for provider
+            for session in existing_sessions {
+                if !seen.contains(&session.id) && !session.path.exists() {
+                    self.db.delete_session(&session.id)?;
+                    report.removed += 1;
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    fn process_file(
+        &mut self,
+        provider: &ProviderConfig,
+        file: &SessionFile,
+        existing_by_path: &HashMap<String, IndexedSession>,
+    ) -> Result<FileProcess> {
+        let path_str = file.canonical_path.to_string_lossy().to_string();
+
+        if let Some(existing) = existing_by_path.get(&path_str)
+            && !existing.is_stale(file.size, file.mtime)
+        {
+            return Ok(FileProcess::Skipped(existing.id.clone()));
+        }
+
+        let canonical_path = file
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| file.canonical_path.clone());
+        if canonical_path != file.canonical_path {
+            let canonical_path_str = canonical_path.to_string_lossy().to_string();
+            if let Some(existing) = existing_by_path.get(&canonical_path_str)
+                && !existing.is_stale(file.size, file.mtime)
+            {
+                return Ok(FileProcess::Skipped(existing.id.clone()));
+            }
+        }
+
+        let ingest = Self::build_ingest(
+            provider,
+            &canonical_path,
+            file.size,
+            file.mtime,
+            file.created_at,
+        )
+        .with_context(|| format!("failed to ingest session from {}", file.path.display()))?;
+        let summary = ingest.summary.clone();
+        self.db.upsert_session(&ingest)?;
+        Ok(FileProcess::Updated(Box::new(summary)))
+    }
+
+    fn build_ingest(
+        provider: &ProviderConfig,
+        path: &Path,
+        size: i64,
+        mtime: i64,
+        created_at: Option<i64>,
+    ) -> Result<SessionIngest> {
+        let (session_id, relative) = compute_session_id(provider, path);
+        let label = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .map(str::to_string)
+            .or_else(|| Some(relative.clone()));
+
+        let mut state = Self::collect_ingest_state(&session_id, path)?;
+
+        if state.messages.is_empty() {
+            Self::handle_empty_transcript(
+                &mut state.messages,
+                &mut state.first_prompt,
+                state.fallback_preview,
+                state.instructions_preview,
+                state.saw_instruction_block,
+                state.saw_any_record,
+                &session_id,
+            )?;
+        }
+
+        if let Some(first) = state.messages.first_mut() {
+            first.is_first = true;
+        }
+
+        let subagent =
+            state.subagent || is_subagent_job_session_texts(state.first_prompt.as_deref(), None);
+        let actionable = state
+            .messages
+            .iter()
+            .any(|message| message.role.eq_ignore_ascii_case("user"))
+            && !subagent;
+        if state.first_prompt.is_none() {
+            state.first_prompt = state
+                .messages
+                .first()
+                .map(|message| message.content.clone());
+        }
+        let session_uuid = state.session_uuid.or_else(|| fallback_session_uuid(path));
+        let started_at = state.earliest_timestamp.or(created_at);
+        let last_active = state.latest_timestamp.unwrap_or(mtime);
+        let summary = SessionSummary {
+            id: session_id,
+            provider: provider.name.clone(),
+            wrapper: state.wrapper,
+            model: state.model,
+            label,
+            thread_name: state.thread_name,
+            path: path.to_path_buf(),
+            uuid: session_uuid,
+            first_prompt: state.first_prompt,
+            actionable,
+            subagent,
+            created_at,
+            started_at,
+            last_active: Some(last_active),
+            size,
+            mtime,
+        };
+
+        Ok(SessionIngest::new(summary, state.messages).with_token_usage(state.token_usage))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn collect_ingest_state(session_id: &str, path: &Path) -> Result<IngestState> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut state = IngestState::default();
+        let mut seen_messages: HashMap<(String, String, Option<i64>), usize> = HashMap::new();
+        let mut seen_token_usage: HashSet<(i64, i64, i64, i64, i64, i64)> = HashSet::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), "skipping invalid json line: {err}");
+                    continue;
+                }
+            };
+            state.saw_any_record = true;
+
+            let wrapper = value
+                .get("wrapper")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    value
+                        .get("payload")
+                        .and_then(|payload| payload.get("wrapper"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| {
+                    value
+                        .get("metadata")
+                        .and_then(|meta| meta.get("wrapper"))
+                        .and_then(Value::as_str)
+                });
+            if state.wrapper.is_none()
+                && let Some(name) = wrapper
+            {
+                state.wrapper = Some(name.to_string());
+            }
+
+            if state.model.is_none() {
+                let model = value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        value
+                            .get("payload")
+                            .and_then(|payload| payload.get("model"))
+                            .and_then(Value::as_str)
+                    })
+                    .or_else(|| {
+                        value
+                            .get("metadata")
+                            .and_then(|meta| meta.get("model"))
+                            .and_then(Value::as_str)
+                    });
+                if let Some(name) = model
+                    && !name.is_empty()
+                {
+                    state.model = Some(name.to_string());
+                }
+            }
+
+            if state.session_uuid.is_none() {
+                state.session_uuid = session_uuid_from_value(&value);
+            }
+
+            if let Some(thread_name) = thread_name_update_from_value(&value) {
+                state.thread_name = thread_name;
+            }
+
+            if value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|ty| ty == "session_meta")
+            {
+                state.current_model = "unknown".to_string();
+                state.subagent |= session_meta_source_is_subagent(&value);
+            }
+
+            if value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|ty| ty == "turn_context")
+                && let Some(model) = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("model"))
+                    .and_then(Value::as_str)
+            {
+                state.current_model = model.to_string();
+            }
+
+            if let Some(instructions) = value
+                .get("payload")
+                .and_then(|payload| payload.get("instructions"))
+                .and_then(Value::as_str)
+            {
+                if state.instructions_preview.is_none() {
+                    state.instructions_preview = summarize_instructions(instructions);
+                }
+                if state.instructions_raw.is_none() {
+                    state.instructions_raw = Some(normalize_instruction_text(instructions));
+                }
+            }
+
+            let source = value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let timestamp = parse_timestamp(&value);
+            if let Some(ts) = timestamp {
+                state.earliest_timestamp = Some(
+                    state
+                        .earliest_timestamp
+                        .map_or(ts, |current| current.min(ts)),
+                );
+                state.latest_timestamp =
+                    Some(state.latest_timestamp.map_or(ts, |current| current.max(ts)));
+            }
+
+            for (role, content) in extract_messages(&value) {
+                let trimmed_content = content.trim();
+                if state.fallback_preview.is_none()
+                    && let Some(line) = trimmed_content
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty() && !line.starts_with('<'))
+                {
+                    state.fallback_preview =
+                        summarize_instructions(line).or_else(|| Some(line.to_string()));
+                }
+
+                if trimmed_content.starts_with("<user_instructions>")
+                    || trimmed_content.starts_with("</user_instructions>")
+                    || trimmed_content.starts_with("<INSTRUCTIONS>")
+                    || trimmed_content.starts_with("</INSTRUCTIONS>")
+                    || trimmed_content.starts_with("<instructions>")
+                    || trimmed_content.starts_with("</instructions>")
+                {
+                    state.saw_instruction_block = true;
+                }
+
+                if let Some(clean) = clean_text(&content) {
+                    let normalized_role = role.to_ascii_lowercase();
+                    let key = (normalized_role.clone(), clean.clone(), timestamp);
+                    if let Some(existing_idx) = seen_messages.get(&key).copied() {
+                        let existing = state.messages.get_mut(existing_idx);
+                        if let Some(existing) = existing {
+                            update_existing_source(existing, source.as_ref());
+                        }
+                    } else {
+                        if is_instruction_banner(&clean, state.instructions_raw.as_deref()) {
+                            state.saw_instruction_block = true;
+                            continue;
+                        }
+                        let is_user = normalized_role == "user";
+                        let index = i64::try_from(state.messages.len()).unwrap_or(i64::MAX);
+                        if state.first_prompt.is_none() && is_user {
+                            state.first_prompt = Some(clean.clone());
+                        }
+                        state.messages.push(MessageRecord::new(
+                            session_id,
+                            index,
+                            role,
+                            clean,
+                            source.clone(),
+                            timestamp,
+                        ));
+                        seen_messages.insert(key, state.messages.len() - 1);
+                    }
+                }
+            }
+
+            if let Some(usage) =
+                extract_token_usage(&value, &state.current_model, session_id, timestamp)
+            {
+                let key = (
+                    usage.timestamp,
+                    usage.input_tokens,
+                    usage.cached_input_tokens,
+                    usage.output_tokens,
+                    usage.reasoning_output_tokens,
+                    usage.total_tokens,
+                );
+                if seen_token_usage.insert(key) {
+                    state.token_usage.push(usage);
+                }
+            }
+        }
+
+        Ok(state)
+    }
+
+    fn handle_empty_transcript(
+        messages: &mut Vec<MessageRecord>,
+        first_prompt: &mut Option<String>,
+        fallback_preview: Option<String>,
+        instructions_preview: Option<String>,
+        saw_instruction_block: bool,
+        saw_any_record: bool,
+        session_id: &str,
+    ) -> Result<()> {
+        let mut preview = fallback_preview.or(instructions_preview).or_else(|| {
+            if saw_instruction_block {
+                Some("Session bootstrapped (instructions only)".to_string())
+            } else {
+                None
+            }
+        });
+
+        if preview.is_none() && saw_any_record {
+            preview = Some("Session created (no transcript yet)".to_string());
+        }
+
+        if let Some(summary) = &mut preview
+            && summary.len() > 240
+        {
+            summary.truncate(240);
+        }
+
+        let preview = preview.ok_or_else(|| eyre!("no messages discovered in session"))?;
+        if first_prompt.is_none() {
+            *first_prompt = Some(preview.clone());
+        }
+        messages.push(MessageRecord::new(
+            session_id, 0, "system", preview, None, None,
+        ));
+        Ok(())
+    }
+}
+
+struct IngestState {
+    messages: Vec<MessageRecord>,
+    first_prompt: Option<String>,
+    fallback_preview: Option<String>,
+    instructions_preview: Option<String>,
+    instructions_raw: Option<String>,
+    saw_instruction_block: bool,
+    saw_any_record: bool,
+    session_uuid: Option<String>,
+    thread_name: Option<String>,
+    earliest_timestamp: Option<i64>,
+    latest_timestamp: Option<i64>,
+    wrapper: Option<String>,
+    model: Option<String>,
+    subagent: bool,
+    token_usage: Vec<TokenUsageRecord>,
+    current_model: String,
+}
+
+impl Default for IngestState {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            first_prompt: None,
+            fallback_preview: None,
+            instructions_preview: None,
+            instructions_raw: None,
+            saw_instruction_block: false,
+            saw_any_record: false,
+            session_uuid: None,
+            thread_name: None,
+            earliest_timestamp: None,
+            latest_timestamp: None,
+            wrapper: None,
+            model: None,
+            subagent: false,
+            token_usage: Vec::new(),
+            current_model: "unknown".to_string(),
+        }
+    }
+}
+
+fn update_existing_source(existing: &mut MessageRecord, source: Option<&String>) {
+    if let Some(value) = source
+        && (existing.source.is_none() || value == "response_item")
+    {
+        existing.source = Some(value.clone());
+    }
+}
+
+fn parse_timestamp(value: &Value) -> Option<i64> {
+    let timestamp = value.get("timestamp").and_then(Value::as_str)?;
+    OffsetDateTime::parse(timestamp, &Rfc3339)
+        .ok()
+        .map(OffsetDateTime::unix_timestamp)
+}
+
+fn is_jsonl(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+}
+
+fn system_time_to_unix(time: Option<SystemTime>) -> Option<i64> {
+    time.and_then(|time| {
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+            .ok()
+    })
+}
+
+fn current_unix_time() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+fn compute_session_id(provider: &ProviderConfig, path: &Path) -> (String, String) {
+    let mut relative = None;
+    for root in &provider.session_roots {
+        if let Ok(stripped) = path.strip_prefix(root) {
+            relative = Some(stripped.to_path_buf());
+            break;
+        }
+        if let Ok(canon_root) = root.canonicalize()
+            && let Ok(stripped) = path.strip_prefix(&canon_root)
+        {
+            relative = Some(stripped.to_path_buf());
+            break;
+        }
+    }
+
+    let relative = match relative {
+        Some(rel) if !rel.as_os_str().is_empty() => rel,
+        _ => path
+            .file_name()
+            .map_or_else(|| path.to_path_buf(), PathBuf::from),
+    };
+
+    let normalized = relative
+        .components()
+        .map(|comp| comp.as_os_str().to_string_lossy())
+        .join("/");
+    let id = format!("{}/{}", provider.name, normalized);
+    (id, normalized)
+}
+
+fn extract_messages(value: &Value) -> Vec<(String, String)> {
+    let mut messages = Vec::new();
+
+    let is_tooling_warning = |text: &str| {
+        let normalized = text.trim();
+        normalized.eq_ignore_ascii_case(
+            "Warning: apply_patch was requested via shell_command. Use the apply_patch tool instead of exec_command.",
+        )
+    };
+
+    if let Some(typ) = value.get("type").and_then(Value::as_str) {
+        match typ {
+            "event_msg" => {
+                if let Some(payload) = value.get("payload")
+                    && payload
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|ty| ty == "user_message")
+                    && let Some(text) = extract_text(payload)
+                    && !is_tooling_warning(&text)
+                {
+                    messages.push(("user".to_string(), text));
+                }
+            }
+            "response_item" | "message" => {
+                let container = value.get("payload").unwrap_or(value);
+                if let Some(role) = container.get("role").and_then(Value::as_str)
+                    && let Some(text) = extract_text(container)
+                    && !is_tooling_warning(&text)
+                {
+                    messages.push((role.to_string(), text));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(role) = value.get("role").and_then(Value::as_str)
+        && let Some(text) = extract_text(value)
+        && !is_tooling_warning(&text)
+    {
+        messages.push((role.to_string(), text));
+    }
+
+    if messages.is_empty()
+        && let Some(role) = value.get("role").and_then(Value::as_str)
+        && let Some(text) = extract_text(value)
+    {
+        messages.push((role.to_string(), text));
+    }
+
+    messages
+}
+
+fn extract_token_usage(
+    value: &Value,
+    current_model: &str,
+    session_id: &str,
+    timestamp: Option<i64>,
+) -> Option<TokenUsageRecord> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        return None;
+    }
+
+    let ts = timestamp?;
+    let info = payload.get("info")?;
+    let last = info.get("last_token_usage")?;
+
+    let model = match current_model {
+        "" | "unknown" => None,
+        other => Some(other.to_string()),
+    };
+    let rate_limits = match payload.get("rate_limits") {
+        Some(Value::Null) | None => None,
+        Some(limits) => serde_json::to_string(limits).ok(),
+    };
+
+    Some(TokenUsageRecord {
+        session_id: session_id.to_string(),
+        timestamp: ts,
+        input_tokens: parse_usage_i64(last.get("input_tokens")),
+        cached_input_tokens: parse_usage_i64(last.get("cached_input_tokens")),
+        output_tokens: parse_usage_i64(last.get("output_tokens")),
+        reasoning_output_tokens: parse_usage_i64(last.get("reasoning_output_tokens")),
+        total_tokens: parse_usage_i64(last.get("total_tokens")),
+        model,
+        rate_limits,
+    })
+}
+
+fn parse_usage_i64(value: Option<&Value>) -> i64 {
+    match value {
+        Some(Value::Number(num)) => {
+            if let Some(value) = num.as_i64() {
+                value
+            } else if let Some(value) = num.as_u64() {
+                i64::try_from(value).unwrap_or(0)
+            } else {
+                0
+            }
+        }
+        Some(Value::String(raw)) => {
+            if let Ok(value) = raw.parse::<i64>() {
+                value
+            } else if let Ok(value) = raw.parse::<u64>() {
+                i64::try_from(value).unwrap_or(0)
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn extract_text(container: &Value) -> Option<String> {
+    if let Some(content) = container.get("content")
+        && let Some(items) = content.as_array()
+    {
+        let mut parts = Vec::new();
+        for item in items {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_string());
+            } else if let Some(message) = item.get("message").and_then(Value::as_str) {
+                parts.push(message.to_string());
+            } else if let Some(text) = item.get("content").and_then(extract_text) {
+                parts.push(text);
+            }
+        }
+        let joined = parts.join("");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+
+    if let Some(text) = container.get("payload").and_then(extract_text) {
+        return Some(text);
+    }
+
+    if let Some(message) = container.get("message").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+    if let Some(text) = container.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    None
+}
+
+const IGNORED_TAG_PREFIXES: [&str; 3] = [
+    "<user_instructions>",
+    "</user_instructions>",
+    "<environment_context>",
+];
+
+fn clean_text(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if IGNORED_TAG_PREFIXES
+        .iter()
+        .any(|tag| trimmed.starts_with(tag))
+    {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn normalize_instruction_text(raw: &str) -> String {
+    raw.replace("<INSTRUCTIONS>", "")
+        .replace("</INSTRUCTIONS>", "")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_instruction_banner(message: &str, instructions_raw: Option<&str>) -> bool {
+    let first_line = message.lines().map(str::trim).find(|line| !line.is_empty());
+    let is_agents_header = first_line.is_some_and(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("# agents.md instructions for ")
+            || lower.starts_with("agents.md instructions for ")
+            || lower.starts_with("# agents.md instructions")
+            || lower.starts_with("agents.md instructions")
+    });
+    if is_agents_header {
+        return true;
+    }
+
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("<instructions>")
+        || lower.contains("</instructions>")
+        || lower.contains("<user_instructions>")
+        || lower.contains("</user_instructions>")
+        || lower.contains("<project_instructions>")
+        || lower.contains("</project_instructions>")
+        || lower.contains("<system_instructions>")
+        || lower.contains("</system_instructions>")
+    {
+        return true;
+    }
+    if let Some(instructions_raw) = instructions_raw {
+        let normalized_message = normalize_instruction_text(message);
+        if normalized_message.contains(instructions_raw) {
+            return true;
+        }
+    }
+    false
+}
+
+fn summarize_instructions(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('<') {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            let summary = trimmed.trim_start_matches('#').trim();
+            if !summary.is_empty() {
+                return Some(summary.to_string());
+            }
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::model::{Defaults, FeatureConfig, SearchMode, SnippetConfig};
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
+    use color_eyre::Result;
+    use indexmap::IndexMap;
+    use serde_json::json;
+    use std::convert::TryFrom;
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    fn provider_with_root(root: &Path) -> ProviderConfig {
+        ProviderConfig {
+            name: "codex".to_string(),
+            bin: "codex".to_string(),
+            flags: Vec::new(),
+            env: Vec::new(),
+            session_roots: vec![root.to_path_buf()],
+            stdin: None,
+        }
+    }
+
+    fn config_from_provider(provider: ProviderConfig) -> Config {
+        let mut providers = IndexMap::new();
+        providers.insert("codex".into(), provider);
+        Config {
+            defaults: Defaults {
+                provider: Some("codex".into()),
+                profile: None,
+                search_mode: SearchMode::FirstPrompt,
+                terminal_title: None,
+            },
+            providers,
+            snippets: SnippetConfig {
+                pre: IndexMap::new(),
+                post: IndexMap::new(),
+            },
+            wrappers: IndexMap::new(),
+            profiles: IndexMap::new(),
+            features: FeatureConfig {
+                prompt_assembler: None,
+            },
+        }
+    }
+
+    #[test]
+    fn instructions_only_sessions_get_placeholder() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("session.jsonl");
+        session_file.write_str(concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"instructions\":\"# General guidance\\n\\nKeep things simple.\\n\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<user_instructions>\\n\\n# General guidance\\n\\nKeep things simple.\\n</user_instructions>\"}]}}\n",
+        ))
+        .expect("write session log");
+
+        let metadata = std::fs::metadata(session_file.path())?;
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let now = current_unix_time();
+        let provider = provider_with_root(temp.path());
+
+        let ingest = Indexer::build_ingest(&provider, session_file.path(), size, now, Some(now))?;
+
+        assert_eq!(ingest.messages.len(), 1);
+        assert_eq!(ingest.messages[0].role, "system");
+        assert!(ingest.messages[0].content.contains("General guidance"));
+        assert!(ingest.messages[0].is_first);
+        assert_eq!(ingest.messages[0].source, None);
+        assert_eq!(ingest.summary.uuid.as_deref(), Some("session"));
+        assert!(!ingest.summary.actionable);
+        assert_eq!(
+            ingest.summary.first_prompt.as_deref(),
+            Some("General guidance")
+        );
+        assert_eq!(ingest.summary.started_at, Some(now));
+        assert_eq!(ingest.summary.last_active, Some(now));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_captures_model_from_session_meta() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("session.jsonl");
+        session_file.write_str(concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"model\":\"o3-mini\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n",
+        ))
+        .expect("write session log");
+
+        let metadata = std::fs::metadata(session_file.path())?;
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let provider = provider_with_root(temp.path());
+
+        let ingest = Indexer::build_ingest(&provider, session_file.path(), size, 1, Some(1))?;
+
+        assert_eq!(ingest.summary.model.as_deref(), Some("o3-mini"));
+        assert_eq!(ingest.summary.first_prompt.as_deref(), Some("Hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_marks_subagent_sessions_from_session_meta_source() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("session.jsonl");
+        session_file.write_str("{\"type\":\"session_meta\",\"payload\":{\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Normal looking prompt\"}}\n")?;
+
+        let metadata = std::fs::metadata(session_file.path())?;
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let now = current_unix_time();
+        let provider = provider_with_root(temp.path());
+
+        let ingest = Indexer::build_ingest(&provider, session_file.path(), size, now, Some(now))?;
+
+        assert!(ingest.summary.subagent);
+        assert!(!ingest.summary.actionable);
+        assert_eq!(
+            ingest.summary.first_prompt.as_deref(),
+            Some("Normal looking prompt")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_captures_thread_name_updates() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("session.jsonl");
+        session_file.write_str("{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_name_updated\",\"thread_id\":\"session-1\",\"thread_name\":\"tax\"}}\n")?;
+
+        let metadata = std::fs::metadata(session_file.path())?;
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let now = current_unix_time();
+        let provider = provider_with_root(temp.path());
+
+        let ingest = Indexer::build_ingest(&provider, session_file.path(), size, now, Some(now))?;
+
+        assert_eq!(ingest.summary.thread_name.as_deref(), Some("tax"));
+        assert_eq!(ingest.summary.first_prompt.as_deref(), Some("Hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn instruction_banners_are_excluded_from_transcript() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("session.jsonl");
+        session_file.write_str(concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"instructions\":\"# General guidance\\n\\nKeep things simple.\\n\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /tmp/project\\n\\n<INSTRUCTIONS>\\n# General guidance\\n- Do not pre-optimize.\\n</INSTRUCTIONS>\"}]}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Real user question\"}]}}\n",
+        ))
+        .expect("write session log");
+
+        let metadata = std::fs::metadata(session_file.path())?;
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let now = current_unix_time();
+        let provider = provider_with_root(temp.path());
+
+        let ingest = Indexer::build_ingest(&provider, session_file.path(), size, now, Some(now))?;
+
+        assert_eq!(ingest.messages.len(), 1);
+        assert_eq!(ingest.messages[0].role, "user");
+        assert_eq!(ingest.messages[0].content, "Real user question");
+        assert!(ingest.messages[0].is_first);
+        assert_eq!(
+            ingest.summary.first_prompt.as_deref(),
+            Some("Real user question")
+        );
+        assert!(ingest.summary.actionable);
+
+        Ok(())
+    }
+
+    #[test]
+    fn instruction_banners_from_system_role_are_excluded() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("session.jsonl");
+        session_file.write_str(concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /tmp/project\\n\\n# General guidance\\n- Do not pre-optimize.\\n\"}]}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Real user question\"}]}}\n",
+        ))
+        .expect("write session log");
+
+        let metadata = std::fs::metadata(session_file.path())?;
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let now = current_unix_time();
+        let provider = provider_with_root(temp.path());
+
+        let ingest = Indexer::build_ingest(&provider, session_file.path(), size, now, Some(now))?;
+
+        assert_eq!(ingest.messages.len(), 1);
+        assert_eq!(ingest.messages[0].role, "user");
+        assert_eq!(ingest.messages[0].content, "Real user question");
+        assert!(ingest.messages[0].is_first);
+        assert_eq!(
+            ingest.summary.first_prompt.as_deref(),
+            Some("Real user question")
+        );
+        assert!(ingest.summary.actionable);
+
+        Ok(())
+    }
+
+    #[test]
+    fn user_and_assistant_messages_are_ingested() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("conversation.jsonl");
+        session_file.write_str(concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello world\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Hi there\"}]}}\n",
+        ))
+        .expect("write session log");
+
+        let metadata = std::fs::metadata(session_file.path())?;
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let now = current_unix_time();
+        let provider = provider_with_root(temp.path());
+
+        let ingest = Indexer::build_ingest(&provider, session_file.path(), size, now, Some(now))?;
+
+        assert_eq!(ingest.messages.len(), 2);
+        assert_eq!(ingest.messages[0].role, "user");
+        assert_eq!(ingest.messages[0].content, "Hello world");
+        assert!(ingest.messages[0].is_first);
+        assert_eq!(ingest.messages[0].source.as_deref(), Some("event_msg"));
+        assert_eq!(ingest.messages[1].role, "assistant");
+        assert!(!ingest.messages[1].is_first);
+        assert_eq!(ingest.messages[1].source.as_deref(), Some("response_item"));
+        assert!(ingest.summary.actionable);
+        assert_eq!(ingest.summary.first_prompt.as_deref(), Some("Hello world"));
+        assert_eq!(ingest.summary.uuid.as_deref(), Some("conversation"));
+        assert_eq!(ingest.summary.started_at, Some(now));
+        assert_eq!(ingest.summary.last_active, Some(now));
+
+        Ok(())
+    }
+
+    #[test]
+    fn token_usage_events_are_ingested() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("usage.jsonl");
+        session_file.write_str(concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"usage\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.1\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-21T00:00:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":5,\"reasoning_output_tokens\":1,\"total_tokens\":16}},\"rate_limits\":{\"primary\":{\"used_percent\":20,\"window_minutes\":60,\"resets_at\":1700000000}}}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-21T00:00:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":5,\"reasoning_output_tokens\":1,\"total_tokens\":16}},\"rate_limits\":{\"primary\":{\"used_percent\":20,\"window_minutes\":60,\"resets_at\":1700000000}}}}\n",
+        ))
+        .expect("write session log");
+
+        let metadata = std::fs::metadata(session_file.path())?;
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let now = current_unix_time();
+        let provider = provider_with_root(temp.path());
+
+        let ingest = Indexer::build_ingest(&provider, session_file.path(), size, now, Some(now))?;
+
+        assert_eq!(ingest.token_usage.len(), 1);
+        let usage = &ingest.token_usage[0];
+        let expected_ts = OffsetDateTime::parse("2026-01-21T00:00:00Z", &Rfc3339)?.unix_timestamp();
+        assert_eq!(usage.timestamp, expected_ts);
+        assert_eq!(usage.model.as_deref(), Some("gpt-5.1"));
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 2);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.reasoning_output_tokens, 1);
+        assert_eq!(usage.total_tokens, 16);
+        assert!(
+            usage
+                .rate_limits
+                .as_deref()
+                .is_some_and(|text| text.contains("primary"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_reports_errors_for_unexpected_payloads() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions_dir = temp.child("sessions");
+        sessions_dir.create_dir_all()?;
+
+        let good = sessions_dir.child("good.jsonl");
+        good.write_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n",
+        )
+        .expect("write good session");
+
+        let bad = sessions_dir.child("bad.jsonl");
+        bad.write_str("{not-json}\n")?;
+
+        let mut providers = IndexMap::new();
+        providers.insert("codex".into(), provider_with_root(sessions_dir.path()));
+
+        let config = Config {
+            defaults: Defaults {
+                provider: Some("codex".into()),
+                profile: None,
+                search_mode: SearchMode::FirstPrompt,
+                terminal_title: None,
+            },
+            providers,
+            snippets: SnippetConfig {
+                pre: IndexMap::new(),
+                post: IndexMap::new(),
+            },
+            wrappers: IndexMap::new(),
+            profiles: IndexMap::new(),
+            features: FeatureConfig {
+                prompt_assembler: None,
+            },
+        };
+
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.updated, 1);
+        assert_eq!(report.errors.len(), 1);
+        let error_path = &report.errors[0].path;
+        assert!(error_path.ends_with("bad.jsonl"));
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_processes_single_file_roots() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("session.jsonl");
+        session_file.write_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Inline root\"}}\n",
+        )
+        .expect("write session");
+
+        let provider = provider_with_root(session_file.path());
+        let config = config_from_provider(provider);
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.updated, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_ignores_missing_roots() -> Result<()> {
+        let temp = TempDir::new()?;
+        let missing = temp.child("missing-root");
+        let provider = provider_with_root(missing.path());
+        let config = config_from_provider(provider);
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.removed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_skips_non_jsonl_file_roots() -> Result<()> {
+        let temp = TempDir::new()?;
+        let notes = temp.child("notes.txt");
+        notes.write_str("not jsonl")?;
+
+        let provider = provider_with_root(notes.path());
+        let config = config_from_provider(provider);
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.updated, 0);
+        assert!(report.errors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_removes_sessions_missing_on_disk() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions_dir = temp.child("sessions");
+        sessions_dir.create_dir_all()?;
+
+        let mut providers = IndexMap::new();
+        providers.insert("codex".into(), provider_with_root(sessions_dir.path()));
+
+        let config = Config {
+            defaults: Defaults {
+                provider: Some("codex".into()),
+                profile: None,
+                search_mode: SearchMode::FirstPrompt,
+                terminal_title: None,
+            },
+            providers,
+            snippets: SnippetConfig {
+                pre: IndexMap::new(),
+                post: IndexMap::new(),
+            },
+            wrappers: IndexMap::new(),
+            profiles: IndexMap::new(),
+            features: FeatureConfig {
+                prompt_assembler: None,
+            },
+        };
+
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        let missing_path = sessions_dir.child("missing.jsonl");
+        let summary = SessionSummary {
+            id: "codex/missing.jsonl".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("orphaned".into()),
+            thread_name: None,
+            path: missing_path.path().to_path_buf(),
+            uuid: Some("missing".into()),
+            first_prompt: Some("hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(0),
+            started_at: Some(0),
+            last_active: Some(0),
+            size: 1,
+            mtime: 1,
+        };
+        let ingest = SessionIngest::new(
+            summary,
+            vec![MessageRecord::new(
+                "codex/missing.jsonl",
+                0,
+                "system",
+                "hello",
+                None,
+                None,
+            )],
+        );
+        db.upsert_session(&ingest)?;
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.updated, 0);
+        assert_eq!(db.count_sessions()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_skips_unchanged_sessions_on_subsequent_runs() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions_dir = temp.child("sessions");
+        sessions_dir.create_dir_all()?;
+
+        let session_file = sessions_dir.child("session.jsonl");
+        session_file.write_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Ping\"}}\n",
+        )
+        .expect("write session");
+
+        let mut providers = IndexMap::new();
+        providers.insert("codex".into(), provider_with_root(sessions_dir.path()));
+
+        let config = Config {
+            defaults: Defaults {
+                provider: Some("codex".into()),
+                profile: None,
+                search_mode: SearchMode::FirstPrompt,
+                terminal_title: None,
+            },
+            providers,
+            snippets: SnippetConfig {
+                pre: IndexMap::new(),
+                post: IndexMap::new(),
+            },
+            wrappers: IndexMap::new(),
+            profiles: IndexMap::new(),
+            features: FeatureConfig {
+                prompt_assembler: None,
+            },
+        };
+
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        {
+            let mut indexer = Indexer::new(&mut db, &config);
+            let report = indexer.run()?;
+            assert_eq!(report.updated, 1);
+            assert_eq!(report.skipped, 0);
+        }
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.skipped, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_handles_missing_roots_and_single_file_providers() -> Result<()> {
+        let temp = TempDir::new()?;
+        let missing = temp.child("missing");
+        let single = temp.child("single.jsonl");
+        single.write_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Ping\"}}\n",
+        )
+        .expect("write session");
+
+        let mut providers = IndexMap::new();
+        providers.insert(
+            "codex".into(),
+            ProviderConfig {
+                name: "codex".into(),
+                bin: "echo".into(),
+                flags: Vec::new(),
+                env: Vec::new(),
+                session_roots: vec![missing.path().to_path_buf(), single.path().to_path_buf()],
+                stdin: None,
+            },
+        );
+
+        let config = Config {
+            defaults: Defaults {
+                provider: Some("codex".into()),
+                profile: None,
+                search_mode: SearchMode::FirstPrompt,
+                terminal_title: None,
+            },
+            providers,
+            snippets: SnippetConfig {
+                pre: IndexMap::new(),
+                post: IndexMap::new(),
+            },
+            wrappers: IndexMap::new(),
+            profiles: IndexMap::new(),
+            features: FeatureConfig {
+                prompt_assembler: None,
+            },
+        };
+
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.updated, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_removes_stale_sessions_when_files_deleted() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions_dir = temp.child("sessions");
+        sessions_dir.create_dir_all()?;
+        let session_file = sessions_dir.child("obsolete.jsonl");
+        session_file.write_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n",
+        )
+        .expect("write session");
+
+        let mut providers = IndexMap::new();
+        providers.insert("codex".into(), provider_with_root(sessions_dir.path()));
+
+        let config = Config {
+            defaults: Defaults {
+                provider: Some("codex".into()),
+                profile: None,
+                search_mode: SearchMode::FirstPrompt,
+                terminal_title: None,
+            },
+            providers,
+            snippets: SnippetConfig {
+                pre: IndexMap::new(),
+                post: IndexMap::new(),
+            },
+            wrappers: IndexMap::new(),
+            profiles: IndexMap::new(),
+            features: FeatureConfig {
+                prompt_assembler: None,
+            },
+        };
+
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        {
+            let mut indexer = Indexer::new(&mut db, &config);
+            let report = indexer.run()?;
+            assert_eq!(report.updated, 1);
+            assert_eq!(db.count_sessions()?, 1);
+        }
+
+        fs::remove_file(session_file.path())?;
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.removed, 1);
+        assert_eq!(db.count_sessions()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn compute_session_id_normalizes_paths() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions_dir = temp.child("sessions");
+        let nested = sessions_dir.child("nested");
+        nested.create_dir_all()?;
+        let file = nested.child("conversation.jsonl");
+        file.write_str("{}\n")?;
+        let provider = provider_with_root(sessions_dir.path());
+        let (id, relative) = compute_session_id(&provider, file.path());
+        assert_eq!(id, format!("{}/nested/conversation.jsonl", provider.name));
+        assert_eq!(relative, "nested/conversation.jsonl");
+        Ok(())
+    }
+
+    #[test]
+    fn compute_session_id_falls_back_to_filename() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions_dir = temp.child("sessions");
+        sessions_dir.create_dir_all()?;
+        let file = temp.child("orphan.jsonl");
+        file.write_str("{}\n")?;
+        let provider = provider_with_root(sessions_dir.path());
+        let (id, relative) = compute_session_id(&provider, file.path());
+        assert_eq!(id, "codex/orphan.jsonl");
+        assert_eq!(relative, "orphan.jsonl");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compute_session_id_handles_canonical_roots() -> Result<()> {
+        use std::os::unix::fs as unix_fs;
+
+        let temp = TempDir::new()?;
+        let real_dir = temp.child("real");
+        real_dir.create_dir_all()?;
+        let file = real_dir.child("symlinked.jsonl");
+        file.write_str("{}\n")?;
+
+        let link = temp.child("link");
+        unix_fs::symlink(real_dir.path(), link.path())?;
+        let provider = provider_with_root(link.path());
+        let (id, relative) = compute_session_id(&provider, file.path());
+        assert_eq!(id, format!("{}/symlinked.jsonl", provider.name));
+        assert_eq!(relative, "symlinked.jsonl");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexer_preserves_canonical_paths_for_nested_symlinks() -> Result<()> {
+        use std::os::unix::fs as unix_fs;
+
+        let temp = TempDir::new()?;
+        let root = temp.child("root");
+        root.create_dir_all()?;
+        let real_dir = temp.child("real");
+        real_dir.create_dir_all()?;
+        let session_file = real_dir.child("conversation.jsonl");
+        session_file.write_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Ping\"}}\n")?;
+        unix_fs::symlink(real_dir.path(), root.child("linked").path())?;
+
+        let config = config_from_provider(provider_with_root(root.path()));
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        {
+            let mut indexer = Indexer::new(&mut db, &config);
+            let report = indexer.run()?;
+            assert_eq!(report.updated, 1);
+        }
+
+        let sessions = db.sessions_for_provider("codex")?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].path, session_file.path().canonicalize()?);
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(db.count_sessions()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_entry_path_falls_back_when_path_is_outside_root() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.child("root");
+        root.create_dir_all()?;
+        let outside = temp.child("outside.jsonl");
+        outside.write_str("{}\n")?;
+
+        let canonical = canonical_entry_path(root.path(), root.path(), outside.path());
+        assert_eq!(canonical, outside.path().canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
+    fn update_existing_source_prefers_response_item() {
+        let mut record = MessageRecord::new(
+            "sess",
+            0,
+            "assistant",
+            "reply",
+            Some("event_msg".into()),
+            None,
+        );
+        update_existing_source(&mut record, Some(&"response_item".to_string()));
+        assert_eq!(record.source.as_deref(), Some("response_item"));
+
+        update_existing_source(&mut record, Some(&"other".to_string()));
+        assert_eq!(record.source.as_deref(), Some("response_item"));
+
+        let mut missing = MessageRecord::new("sess", 1, "assistant", "text", None, None);
+        update_existing_source(&mut missing, Some(&"event_msg".to_string()));
+        assert_eq!(missing.source.as_deref(), Some("event_msg"));
+    }
+
+    #[test]
+    fn extract_text_handles_nested_payloads() {
+        let nested = json!({
+            "payload": {
+                "content": [
+                    {"type": "text", "text": "Hello"},
+                    {"type": "text", "text": " world"}
+                ]
+            }
+        });
+        assert_eq!(extract_text(&nested), Some("Hello world".into()));
+
+        let message = json!({
+            "message": "fallback"
+        });
+        assert_eq!(extract_text(&message), Some("fallback".into()));
+    }
+
+    #[test]
+    fn extract_messages_covers_event_and_response() {
+        let event = json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "Hello"
+            }
+        });
+        let mut results = extract_messages(&event);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "user");
+
+        let response = json!({
+            "type": "response_item",
+            "payload": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hi"}]
+            }
+        });
+        results = extract_messages(&response);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "assistant");
+
+        let direct = json!({
+            "role": "system",
+            "content": [{"type": "text", "text": "System"}]
+        });
+        results = extract_messages(&direct);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "system");
+    }
+
+    #[test]
+    fn indexer_single_file_root_reports_skipped_on_second_run() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("session.jsonl");
+        session_file.write_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n",
+        )
+        .expect("write session");
+
+        let provider = provider_with_root(session_file.path());
+        let config = config_from_provider(provider);
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        {
+            let mut indexer = Indexer::new(&mut db, &config);
+            let report = indexer.run()?;
+            assert_eq!(report.updated, 1);
+            assert_eq!(report.skipped, 0);
+        }
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.errors.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_single_file_root_collects_errors() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("broken.jsonl");
+        session_file.write_str("{not-json}\n")?;
+
+        let provider = provider_with_root(session_file.path());
+        let config = config_from_provider(provider);
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].path.ends_with("broken.jsonl"));
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_walkdir_skips_non_jsonl_files() -> Result<()> {
+        let temp = TempDir::new()?;
+        let sessions_dir = temp.child("sessions");
+        sessions_dir.create_dir_all()?;
+        sessions_dir.child("notes.txt").write_str("ignore")?;
+
+        let provider = provider_with_root(sessions_dir.path());
+        let config = config_from_provider(provider);
+        let db_path = temp.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path())?;
+
+        let mut indexer = Indexer::new(&mut db, &config);
+        let report = indexer.run()?;
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.errors.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn collect_ingest_state_reads_wrapper_and_skips_blank_lines() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("wrapper.jsonl");
+        session_file.write_str(concat!(
+            "\n",
+            "  \n",
+            "{\"type\":\"event_msg\",\"payload\":{\"wrapper\":\"shellwrap\",\"type\":\"user_message\",\"message\":\"Hello\"}}\n",
+        ))
+        .expect("write session");
+
+        let state = Indexer::collect_ingest_state("codex/wrapper.jsonl", session_file.path())?;
+        assert_eq!(state.wrapper.as_deref(), Some("shellwrap"));
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].content, "Hello");
+        Ok(())
+    }
+
+    #[test]
+    fn handle_empty_transcript_uses_instruction_only_placeholder() {
+        let mut messages = Vec::new();
+        let mut first_prompt = None;
+        Indexer::handle_empty_transcript(
+            &mut messages,
+            &mut first_prompt,
+            None,
+            None,
+            true,
+            false,
+            "codex/placeholder",
+        )
+        .expect("build placeholder");
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .contains("Session bootstrapped (instructions only)")
+        );
+    }
+
+    #[test]
+    fn handle_empty_transcript_truncates_long_preview() {
+        let mut messages = Vec::new();
+        let mut first_prompt = None;
+        Indexer::handle_empty_transcript(
+            &mut messages,
+            &mut first_prompt,
+            Some("x".repeat(300)),
+            None,
+            false,
+            true,
+            "codex/long",
+        )
+        .expect("truncate preview");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), 240);
+        assert_eq!(first_prompt.as_deref().map(str::len), Some(240));
+    }
+
+    #[test]
+    fn extract_messages_falls_back_when_primary_path_filters_tooling_warning() {
+        let direct = json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Warning: apply_patch was requested via shell_command. Use the apply_patch tool instead of exec_command."
+                }
+            ]
+        });
+        let messages = extract_messages(&direct);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "user");
+    }
+
+    #[test]
+    fn extract_messages_reads_direct_role_when_type_is_unknown() {
+        let direct = json!({
+            "type": "unknown_type",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Direct path"}]
+        });
+        let messages = extract_messages(&direct);
+        assert_eq!(
+            messages,
+            vec![("assistant".to_string(), "Direct path".to_string())]
+        );
+    }
+
+    #[test]
+    fn extract_messages_returns_empty_for_unhandled_object_without_role() {
+        let value = json!({
+            "type": "unknown_type",
+            "payload": {"ignored": true}
+        });
+        let messages = extract_messages(&value);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn extract_token_usage_handles_null_rate_limits() {
+        let event = json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 10,
+                        "cached_input_tokens": 2,
+                        "output_tokens": 5,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 16
+                    }
+                },
+                "rate_limits": null
+            }
+        });
+        let usage = extract_token_usage(&event, "unknown", "sess", Some(1)).expect("usage");
+        assert_eq!(usage.rate_limits, None);
+        assert_eq!(usage.model, None);
+    }
+
+    #[test]
+    fn parse_usage_i64_handles_number_and_string_edges() {
+        let u64_value = Value::Number(serde_json::Number::from((i64::MAX as u64) + 1));
+        assert_eq!(parse_usage_i64(Some(&u64_value)), 0);
+
+        let float_value = Value::Number(serde_json::Number::from_f64(1.5).expect("finite"));
+        assert_eq!(parse_usage_i64(Some(&float_value)), 0);
+
+        let signed_text = Value::String("42".to_string());
+        assert_eq!(parse_usage_i64(Some(&signed_text)), 42);
+
+        let unsigned_text = Value::String(((i64::MAX as u64) + 1).to_string());
+        assert_eq!(parse_usage_i64(Some(&unsigned_text)), 0);
+
+        let invalid_text = Value::String("not-a-number".to_string());
+        assert_eq!(parse_usage_i64(Some(&invalid_text)), 0);
+
+        assert_eq!(parse_usage_i64(None), 0);
+    }
+
+    #[test]
+    fn extract_text_supports_message_and_nested_content_items() {
+        let value = json!({
+            "content": [
+                {"message": "Hello"},
+                {"content": {"content": [{"text": " world"}]}}
+            ]
+        });
+        assert_eq!(extract_text(&value), Some("Hello world".to_string()));
+    }
+
+    #[test]
+    fn instruction_helpers_cover_non_banner_and_empty_summary_paths() {
+        assert!(is_instruction_banner(
+            "# AGENTS.md instructions for /tmp/project",
+            None
+        ));
+        assert!(!is_instruction_banner("regular user message", None));
+        assert!(is_instruction_banner(
+            "regular user message",
+            Some("regular user message")
+        ));
+        assert!(is_instruction_banner(
+            "<system_instructions>be precise</system_instructions>",
+            None
+        ));
+        assert_eq!(summarize_instructions("\n<INSTRUCTIONS>\n#\n"), None);
+    }
+
+    #[test]
+    fn collect_ingest_state_deduplicates_messages_and_upgrades_source() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session_file = temp.child("duplicate.jsonl");
+        session_file.write_str("{\"type\":\"event_msg\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"payload\":{\"wrapper\":\"shellwrap\",\"type\":\"user_message\",\"message\":\"Hello\"}}\n{\"type\":\"response_item\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}}\n")?;
+
+        let state = Indexer::collect_ingest_state("codex/duplicate.jsonl", session_file.path())?;
+        assert_eq!(state.wrapper.as_deref(), Some("shellwrap"));
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].content, "Hello");
+        assert_eq!(state.messages[0].source.as_deref(), Some("response_item"));
+        Ok(())
+    }
+
+    #[test]
+    fn extract_text_and_clean_text_cover_fallback_paths() {
+        assert_eq!(
+            extract_text(&json!({"content":[{"text":"Hello"},{"message":" world"}]})),
+            Some("Hello world".to_string())
+        );
+        assert_eq!(
+            extract_text(&json!({"content":[{"type":"unknown"}], "payload":{"text":"fallback"}})),
+            Some("fallback".to_string())
+        );
+        assert_eq!(
+            extract_text(&json!({"text":"fallback"})),
+            Some("fallback".into())
+        );
+        assert_eq!(extract_text(&json!({"unknown": true})), None);
+        assert_eq!(clean_text("   "), None);
+    }
+}

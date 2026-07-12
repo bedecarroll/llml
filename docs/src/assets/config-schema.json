@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RawConfig",
+  "type": "object",
+  "properties": {
+    "features": {
+      "$ref": "#/$defs/RawFeatures"
+    },
+    "profile": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RawProfile"
+      }
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "providers": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RawProvider"
+      }
+    },
+    "search_mode": {
+      "type": "string",
+      "default": "first_prompt"
+    },
+    "snippets": {
+      "$ref": "#/$defs/RawSnippets"
+    },
+    "terminal_title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "wrappers": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RawWrapper"
+      }
+    }
+  },
+  "$defs": {
+    "RawFeatures": {
+      "type": "object",
+      "properties": {
+        "pa": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawPromptAssembler"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "RawProfile": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "post": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "pre": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "prompt_assembler": {
+          "description": "Prompt name to render via the prompt-assembler helper before launching the provider.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "prompt_assembler_args": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "provider": {
+          "type": "string"
+        },
+        "wrap": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "provider"
+      ]
+    },
+    "RawPromptAssembler": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "namespace": {
+          "type": "string",
+          "default": "pa"
+        }
+      }
+    },
+    "RawProvider": {
+      "type": "object",
+      "properties": {
+        "bin": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "flags": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "stdin_mode": {
+          "$ref": "#/$defs/RawStdinMode"
+        },
+        "stdin_to": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      }
+    },
+    "RawSnippets": {
+      "type": "object",
+      "properties": {
+        "post": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "pre": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      }
+    },
+    "RawStdinMode": {
+      "description": "Controls how tx streams prompts to provider executables. Use 'capture_arg' to pass the prompt as an argument.",
+      "type": "string",
+      "default": "pipe",
+      "enum": [
+        "pipe",
+        "capture_arg"
+      ]
+    },
+    "RawWrapper": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "$ref": "#/$defs/WrapperCommandSpec"
+        },
+        "shell": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "cmd"
+      ]
+    },
+    "WrapperCommandSpec": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    }
+  }
+}

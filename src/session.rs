@@ -1,0 +1,519 @@
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub provider: String,
+    pub wrapper: Option<String>,
+    pub model: Option<String>,
+    pub label: Option<String>,
+    pub thread_name: Option<String>,
+    pub path: PathBuf,
+    pub uuid: Option<String>,
+    pub first_prompt: Option<String>,
+    pub actionable: bool,
+    pub subagent: bool,
+    pub created_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub last_active: Option<i64>,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionIngest {
+    pub summary: SessionSummary,
+    pub messages: Vec<MessageRecord>,
+    pub token_usage: Vec<TokenUsageRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageRecord {
+    pub session_id: String,
+    pub index: i64,
+    pub source_event_id: Option<i64>,
+    pub role: String,
+    pub content: String,
+    pub source: Option<String>,
+    pub timestamp: Option<i64>,
+    pub is_first: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenUsageRecord {
+    pub session_id: String,
+    pub timestamp: i64,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+    pub model: Option<String>,
+    pub rate_limits: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionQuery {
+    pub id: String,
+    pub provider: String,
+    pub wrapper: Option<String>,
+    pub label: Option<String>,
+    pub thread_name: Option<String>,
+    pub first_prompt: Option<String>,
+    pub actionable: bool,
+    pub subagent: bool,
+    pub last_active: Option<i64>,
+}
+
+impl SessionSummary {
+    #[must_use]
+    pub fn is_stale(&self, size: i64, mtime: i64) -> bool {
+        self.size != size || self.mtime != mtime
+    }
+
+    pub fn has_path<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.path == path.as_ref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub session_id: String,
+    pub provider: String,
+    pub wrapper: Option<String>,
+    pub label: Option<String>,
+    pub role: Option<String>,
+    pub snippet: Option<String>,
+    pub last_active: Option<i64>,
+    pub actionable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Transcript {
+    pub session: SessionSummary,
+    pub messages: Vec<MessageRecord>,
+}
+
+impl Transcript {
+    #[must_use]
+    pub fn markdown_lines(&self, limit: Option<usize>) -> Vec<String> {
+        let mut lines = Vec::new();
+        let header_id = self.session.uuid.as_deref().unwrap_or(&self.session.id);
+        lines.push(format!("# Codex Session {header_id}"));
+        if let Some(wrapper) = self.session.wrapper.as_deref() {
+            lines.push(format!("**Wrapper**: `{wrapper}`"));
+        }
+        lines.push(String::new());
+
+        let mut emitted = 0usize;
+        let mut total_renderable = 0usize;
+
+        for message in &self.messages {
+            let role_lower = message.role.to_ascii_lowercase();
+            if role_lower != "user" && role_lower != "assistant" {
+                continue;
+            }
+
+            let text = message.content.trim_start();
+            let trimmed = text.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("<user_instructions>")
+                || trimmed.starts_with("<environment_context>")
+            {
+                continue;
+            }
+
+            total_renderable += 1;
+
+            if limit.is_some_and(|max| emitted >= max) {
+                continue;
+            }
+
+            let role_title = if role_lower == "user" {
+                "User"
+            } else {
+                "Assistant"
+            };
+
+            let timestamp = message
+                .timestamp
+                .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok())
+                .and_then(|dt| dt.format(&Rfc3339).ok())
+                .unwrap_or_else(|| "-".to_string());
+
+            lines.push(format!("## {timestamp} — {role_title}"));
+            lines.push(String::new());
+            lines.extend(text.lines().map(str::to_string));
+            lines.push(String::new());
+
+            emitted += 1;
+        }
+
+        if let Some(limit) = limit
+            && total_renderable > limit
+        {
+            lines.push(format!(
+                "*… and {} more messages*",
+                total_renderable - limit
+            ));
+            lines.push(String::new());
+        }
+
+        lines
+    }
+}
+
+impl SessionIngest {
+    #[must_use]
+    pub fn new(summary: SessionSummary, messages: Vec<MessageRecord>) -> Self {
+        Self {
+            summary,
+            messages,
+            token_usage: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_token_usage(mut self, token_usage: Vec<TokenUsageRecord>) -> Self {
+        self.token_usage = token_usage;
+        self
+    }
+}
+
+impl MessageRecord {
+    pub fn new(
+        session_id: impl Into<String>,
+        index: i64,
+        role: impl Into<String>,
+        content: impl Into<String>,
+        source: Option<String>,
+        timestamp: Option<i64>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            index,
+            source_event_id: Some(index),
+            role: role.into(),
+            content: content.into(),
+            source,
+            timestamp,
+            is_first: false,
+        }
+    }
+}
+
+#[must_use]
+pub fn is_subagent_job_boilerplate(text: &str) -> bool {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized.to_ascii_lowercase();
+    normalized.contains("you are processing one item for a generic agent job")
+        || normalized.contains("generic agent job")
+        || normalized.contains(
+            "the following is the codex agent history whose request action you are assessing",
+        )
+        || normalized.contains("assess the exact planned action")
+}
+
+#[must_use]
+pub fn is_subagent_job_session_texts(first_prompt: Option<&str>, snippet: Option<&str>) -> bool {
+    first_prompt.is_some_and(is_subagent_job_boilerplate)
+        || snippet.is_some_and(is_subagent_job_boilerplate)
+}
+
+#[must_use]
+pub fn session_meta_source_is_subagent(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|ty| ty == "session_meta")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("source"))
+            .and_then(Value::as_object)
+            .is_some_and(|source| source.contains_key("subagent"))
+}
+
+#[must_use]
+pub fn thread_name_update_from_value(value: &Value) -> Option<Option<String>> {
+    let payload = value.get("payload");
+
+    let is_session_meta = value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|ty| ty == "session_meta");
+    if is_session_meta && payload.and_then(|inner| inner.get("thread_name")).is_some() {
+        return Some(normalize_thread_name(
+            payload.and_then(|inner| inner.get("thread_name")),
+        ));
+    }
+
+    let update_type = payload
+        .and_then(|inner| inner.get("type"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("type").and_then(Value::as_str));
+    if update_type.is_some_and(|ty| ty == "thread_name_updated") {
+        return Some(normalize_thread_name(
+            payload
+                .and_then(|inner| inner.get("thread_name"))
+                .or_else(|| value.get("thread_name")),
+        ));
+    }
+
+    None
+}
+
+fn normalize_thread_name(value: Option<&Value>) -> Option<String> {
+    let raw = value.and_then(Value::as_str)?.trim();
+    (!raw.is_empty()).then(|| raw.to_string())
+}
+
+/// Attempt to extract a session UUID from a parsed Codex log entry.
+#[must_use]
+pub fn session_uuid_from_value(value: &Value) -> Option<String> {
+    let map = value.as_object()?;
+
+    if let Some(payload) = map.get("payload")
+        && let Some(uuid) = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("session_id").and_then(Value::as_str))
+    {
+        return Some(uuid.to_string());
+    }
+
+    if let Some(session) = map.get("session")
+        && let Some(uuid) = session.get("id").and_then(Value::as_str)
+    {
+        return Some(uuid.to_string());
+    }
+
+    map.get("id").and_then(Value::as_str).map(str::to_string)
+}
+
+/// Derive a fallback session UUID from the log file path when the payload does not expose one.
+#[must_use]
+pub fn fallback_session_uuid(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let trimmed = file_name.strip_suffix(".jsonl").unwrap_or(file_name);
+
+    if let Some(stripped) = trimmed.strip_prefix("rollout-") {
+        if let Some((_, suffix)) = stripped.rsplit_once('-') {
+            return Some(suffix.to_string());
+        }
+        return Some(stripped.to_string());
+    }
+
+    Some(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    fn sample_summary() -> SessionSummary {
+        SessionSummary {
+            id: "sample".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("demo".into()),
+            thread_name: None,
+            path: PathBuf::from("/tmp/sample.jsonl"),
+            uuid: Some("abc123".into()),
+            first_prompt: Some("Hello world".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(1),
+            started_at: Some(2),
+            last_active: Some(3),
+            size: 1024,
+            mtime: 4,
+        }
+    }
+
+    #[test]
+    fn transcript_markdown_limits_output() {
+        let mut messages = Vec::new();
+        for (idx, (role, content)) in [
+            ("user", "First message"),
+            ("assistant", "Response"),
+            ("system", "Skip me"),
+            (
+                "assistant",
+                "<user_instructions>ignored</user_instructions>",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = MessageRecord::new(
+                "sample",
+                i64::try_from(idx).expect("message index within i64 range"),
+                role,
+                content,
+                None,
+                Some(5),
+            );
+            if idx == 0 {
+                record.is_first = true;
+            }
+            messages.push(record);
+        }
+        let transcript = Transcript {
+            session: sample_summary(),
+            messages,
+        };
+
+        let lines = transcript.markdown_lines(Some(1));
+        assert!(lines.iter().any(|line| line.contains("First message")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("… and 1 more messages"))
+        );
+        assert!(lines.iter().all(|line| !line.contains("Skip me")));
+    }
+
+    #[test]
+    fn thread_name_update_handles_meta_empty_and_invalid_values() {
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "thread_name": "  tax  "
+            }
+        });
+        assert_eq!(
+            thread_name_update_from_value(&meta),
+            Some(Some("tax".to_string()))
+        );
+
+        let empty = serde_json::json!({
+            "type": "thread_name_updated",
+            "payload": {
+                "thread_name": "   "
+            }
+        });
+        assert_eq!(thread_name_update_from_value(&empty), Some(None));
+
+        let invalid = serde_json::json!({
+            "type": "thread_name_updated",
+            "payload": {
+                "thread_name": 7
+            }
+        });
+        assert_eq!(thread_name_update_from_value(&invalid), Some(None));
+    }
+
+    #[test]
+    fn transcript_markdown_includes_assistant_roles_without_limit() {
+        let mut messages = Vec::new();
+        for (idx, (role, content)) in [("user", "Hello"), ("assistant", "Hi there")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut record = MessageRecord::new(
+                "sample",
+                i64::try_from(idx).expect("message index within i64 range"),
+                role,
+                content,
+                None,
+                Some(5),
+            );
+            if idx == 0 {
+                record.is_first = true;
+            }
+            messages.push(record);
+        }
+        let transcript = Transcript {
+            session: sample_summary(),
+            messages,
+        };
+
+        let lines = transcript.markdown_lines(None);
+        assert!(lines.iter().any(|line| line.contains("— User")));
+        assert!(lines.iter().any(|line| line.contains("— Assistant")));
+    }
+
+    #[test]
+    fn session_summary_has_path_matches_exact_path() {
+        let summary = sample_summary();
+        assert!(summary.has_path("/tmp/sample.jsonl"));
+        assert!(!summary.has_path("/tmp/other.jsonl"));
+    }
+
+    #[test]
+    fn session_uuid_from_value_falls_back_to_session_key() {
+        let value: Value =
+            serde_json::json!({"session": {"id": "session-1"}, "payload": {"type": "noop"}});
+        assert_eq!(session_uuid_from_value(&value), Some("session-1".into()));
+    }
+
+    #[test]
+    fn session_uuid_from_value_uses_payload_id() {
+        let value: Value = serde_json::json!({"payload": {"id": "payload-42"}});
+        assert_eq!(session_uuid_from_value(&value), Some("payload-42".into()));
+    }
+
+    #[test]
+    fn subagent_job_detection_normalizes_whitespace() {
+        assert!(is_subagent_job_boilerplate(
+            "You are   processing one item for a generic\nagent job. Job ID: xyz"
+        ));
+        assert!(is_subagent_job_boilerplate(
+            "The following is the Codex agent history whose request action you are assessing."
+        ));
+        assert!(is_subagent_job_boilerplate(
+            "Assess the exact planned action below."
+        ));
+        assert!(is_subagent_job_session_texts(
+            Some("normal"),
+            Some("generic agent job")
+        ));
+        assert!(!is_subagent_job_session_texts(
+            Some("normal prompt"),
+            Some("ordinary snippet")
+        ));
+    }
+
+    #[test]
+    fn session_uuid_from_value_returns_none_for_non_object() {
+        let value: Value = serde_json::json!(["not", "an", "object"]);
+        assert_eq!(session_uuid_from_value(&value), None);
+    }
+
+    #[test]
+    fn fallback_session_uuid_extracts_rollout_suffix() {
+        let path = Path::new("/tmp/rollout-2024-10-26-abcdef.jsonl");
+        assert_eq!(fallback_session_uuid(path), Some("abcdef".to_string()));
+    }
+
+    #[test]
+    fn fallback_session_uuid_handles_rollout_without_suffix() {
+        let path = Path::new("/tmp/rollout-log.jsonl");
+        assert_eq!(fallback_session_uuid(path), Some("log".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_session_uuid_returns_none_for_non_utf8_name() {
+        let file_name =
+            OsString::from_vec(vec![0x66, 0x6f, 0xff, 0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x6c]);
+        let path = PathBuf::from("/tmp").join(file_name);
+        assert_eq!(fallback_session_uuid(&path), None);
+    }
+
+    #[test]
+    fn session_summary_staleness_detects_changes() {
+        let summary = sample_summary();
+        assert!(summary.is_stale(2048, 8));
+        assert!(!summary.is_stale(1024, 4));
+    }
+}

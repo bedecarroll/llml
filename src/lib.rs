@@ -1,0 +1,484 @@
+#![allow(unexpected_cfgs)]
+
+pub mod commands;
+pub mod config;
+pub mod db;
+pub mod indexer;
+pub mod pipeline;
+pub mod prompts;
+pub mod providers;
+pub mod rag;
+pub mod session;
+pub mod sqlite_ext;
+
+mod app;
+pub mod cli;
+pub mod internal;
+#[doc(hidden)]
+pub mod test_support;
+mod tui;
+mod util;
+
+use clap::{CommandFactory, Parser};
+use cli::Command;
+
+pub use cli::Cli;
+
+/// Run the tx CLI entrypoint.
+///
+/// # Errors
+///
+/// Returns an error when initialization or the chosen command fails to execute.
+pub fn run(cli: &Cli) -> color_eyre::Result<()> {
+    init_tracing(cli);
+    sqlite_ext::init_sqlite_extensions()?;
+
+    if let Some(Command::Internal(cmd)) = &cli.command {
+        return internal::run(cmd);
+    }
+
+    if let Some(Command::Db(cmd)) = &cli.command {
+        return commands::db::run(cmd, cli.config_dir.as_deref(), cli.quiet);
+    }
+
+    let mut app = app::App::bootstrap(cli)?;
+    if let Some(Command::Search(cmd)) = &cli.command {
+        return app.search(cmd);
+    }
+    if let Some(Command::Resume(cmd)) = &cli.command {
+        return app.resume(cmd);
+    }
+    if let Some(Command::Export(cmd)) = &cli.command {
+        return app.export(cmd);
+    }
+    if let Some(Command::Rag(cmd)) = &cli.command {
+        return app.rag(cmd);
+    }
+    if let Some(Command::Stats(cmd)) = &cli.command {
+        return app.stats(cmd);
+    }
+    if let Some(Command::Config(cmd)) = &cli.command {
+        return app.config(cmd);
+    }
+    if matches!(&cli.command, Some(Command::Doctor)) {
+        return app.doctor();
+    }
+    if let Some(Command::SelfUpdate(cmd)) = &cli.command {
+        return app.self_update(cmd);
+    }
+    app.run_ui()
+}
+
+fn init_tracing(cli: &Cli) {
+    let level = desired_level(cli);
+    let mut filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy();
+    let directive = "tui_markdown=off"
+        .parse::<tracing_subscriber::filter::Directive>()
+        .expect("valid tracing directive literal");
+    filter = filter.add_directive(directive);
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+fn desired_level(cli: &Cli) -> tracing::level_filters::LevelFilter {
+    if cli.quiet {
+        return tracing::level_filters::LevelFilter::ERROR;
+    }
+
+    match cli.verbose {
+        0 => tracing::level_filters::LevelFilter::INFO,
+        1 => tracing::level_filters::LevelFilter::DEBUG,
+        _ => tracing::level_filters::LevelFilter::TRACE,
+    }
+}
+
+#[must_use]
+pub fn command() -> clap::Command {
+    Cli::command()
+}
+
+/// Parse CLI arguments.
+#[must_use]
+pub fn parse_cli() -> Cli {
+    Cli::parse()
+}
+
+/// Return a suggested process exit code for a CLI error.
+#[must_use]
+pub fn exit_code_for_error(err: &color_eyre::Report) -> i32 {
+    if let Some(app_error) = err.downcast_ref::<app::AppError>()
+        && matches!(app_error, app::AppError::ProviderMismatch { .. })
+    {
+        return 2;
+    }
+    1
+}
+
+/// Write a CLI error and its cause chain to the provided writer.
+///
+/// The first line is prefixed with `tx:` followed by any chained causes.
+///
+/// # Errors
+///
+/// Returns an error when writing to `writer` fails.
+pub fn write_cli_error(
+    err: &color_eyre::Report,
+    mut writer: impl std::io::Write,
+) -> std::io::Result<()> {
+    writeln!(writer, "tx: {err}")?;
+    for cause in err.chain().skip(1) {
+        writeln!(writer, "    caused by: {cause}")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Command, ResumeCommand, SelfUpdateCommand};
+    #[cfg(unix)]
+    use crate::cli::{InternalCaptureArgCommand, InternalCommand};
+    use crate::db::Database;
+    use crate::session::{MessageRecord, SessionIngest, SessionSummary};
+    use crate::test_support::{ENV_LOCK, EnvOverride, toml_path};
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn desired_level_handles_quiet_and_verbose() {
+        let mut cli = Cli {
+            config_dir: None,
+            verbose: 0,
+            quiet: false,
+            command: None,
+        };
+        assert_eq!(
+            desired_level(&cli),
+            tracing::level_filters::LevelFilter::INFO
+        );
+
+        cli.verbose = 1;
+        assert_eq!(
+            desired_level(&cli),
+            tracing::level_filters::LevelFilter::DEBUG
+        );
+
+        cli.verbose = 2;
+        assert_eq!(
+            desired_level(&cli),
+            tracing::level_filters::LevelFilter::TRACE
+        );
+
+        cli.quiet = true;
+        assert_eq!(
+            desired_level(&cli),
+            tracing::level_filters::LevelFilter::ERROR
+        );
+    }
+
+    #[test]
+    fn init_tracing_is_idempotent() {
+        let cli = Cli {
+            config_dir: None,
+            verbose: 0,
+            quiet: false,
+            command: None,
+        };
+        init_tracing(&cli);
+        init_tracing(&cli);
+    }
+
+    #[test]
+    fn command_factory_returns_named_command() {
+        let cmd = command();
+        assert_eq!(cmd.get_name(), "tx");
+        assert!(cmd.get_about().is_some());
+    }
+
+    #[test]
+    fn exit_code_for_error_maps_provider_mismatch() {
+        let mismatch = color_eyre::Report::new(app::AppError::ProviderMismatch {
+            expected: "codex".into(),
+            actual: "alt".into(),
+        });
+        assert_eq!(exit_code_for_error(&mismatch), 2);
+
+        let other = color_eyre::eyre::eyre!("boom");
+        assert_eq!(exit_code_for_error(&other), 1);
+    }
+
+    #[test]
+    fn write_cli_error_renders_error_chain() {
+        let err = color_eyre::eyre::eyre!("root")
+            .wrap_err("middle")
+            .wrap_err("top");
+        let mut output = Vec::new();
+        write_cli_error(&err, &mut output).expect("write should succeed");
+        let rendered = String::from_utf8(output).expect("utf8");
+        assert!(rendered.contains("tx: top"));
+        assert!(rendered.contains("caused by: middle"));
+        assert!(rendered.contains("caused by: root"));
+    }
+
+    #[test]
+    fn run_executes_config_where_command() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.child("config");
+        config_dir.create_dir_all().expect("create config dir");
+        let sessions_dir = config_dir.child("sessions");
+        sessions_dir.create_dir_all().expect("create sessions dir");
+        let config_toml = format!(
+            r#"
+provider = "codex"
+
+[providers.codex]
+bin = "echo"
+session_roots = ["{root}"]
+        "#,
+            root = toml_path(sessions_dir.path()),
+        );
+        config_dir
+            .child("config.toml")
+            .write_str(&config_toml)
+            .expect("write config");
+
+        let data_dir = temp.child("data");
+        data_dir.create_dir_all().expect("create data dir");
+        let cache_dir = temp.child("cache");
+        cache_dir.create_dir_all().expect("create cache dir");
+
+        let _data_guard = EnvOverride::set_path("TX_DATA_DIR", data_dir.path());
+        let _cache_guard = EnvOverride::set_path("TX_CACHE_DIR", cache_dir.path());
+
+        let cli = Cli {
+            config_dir: Some(config_dir.path().to_path_buf()),
+            verbose: 0,
+            quiet: false,
+            command: Some(Command::Config(crate::cli::ConfigCommand::Where)),
+        };
+
+        run(&cli).expect("run config where");
+    }
+
+    #[test]
+    fn run_invokes_ui_when_no_command() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.child("config");
+        config_dir.create_dir_all().expect("create config dir");
+        let sessions_dir = config_dir.child("sessions");
+        sessions_dir.create_dir_all().expect("create sessions dir");
+        let config_toml = format!(
+            r#"
+provider = "codex"
+
+[providers.codex]
+bin = "echo"
+session_roots = ["{root}"]
+        "#,
+            root = toml_path(sessions_dir.path()),
+        );
+        config_dir
+            .child("config.toml")
+            .write_str(&config_toml)
+            .expect("write config");
+
+        let data_dir = temp.child("data");
+        data_dir.create_dir_all().expect("create data dir");
+        let cache_dir = temp.child("cache");
+        cache_dir.create_dir_all().expect("create cache dir");
+
+        let _data_guard = EnvOverride::set_path("TX_DATA_DIR", data_dir.path());
+        let _cache_guard = EnvOverride::set_path("TX_CACHE_DIR", cache_dir.path());
+
+        let cli = Cli {
+            config_dir: Some(config_dir.path().to_path_buf()),
+            verbose: 0,
+            quiet: false,
+            command: None,
+        };
+
+        run(&cli).expect("run ui");
+    }
+
+    #[test]
+    fn run_executes_self_update_command() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.child("config");
+        config_dir.create_dir_all().expect("create config dir");
+        let sessions_dir = config_dir.child("sessions");
+        sessions_dir.create_dir_all().expect("create sessions dir");
+        let config_toml = format!(
+            r#"
+provider = "codex"
+
+[providers.codex]
+bin = "echo"
+session_roots = ["{root}"]
+        "#,
+            root = toml_path(sessions_dir.path()),
+        );
+        config_dir
+            .child("config.toml")
+            .write_str(&config_toml)
+            .expect("write config");
+
+        let data_dir = temp.child("data");
+        data_dir.create_dir_all().expect("create data dir");
+        let cache_dir = temp.child("cache");
+        cache_dir.create_dir_all().expect("create cache dir");
+
+        let _data_guard = EnvOverride::set_path("TX_DATA_DIR", data_dir.path());
+        let _cache_guard = EnvOverride::set_path("TX_CACHE_DIR", cache_dir.path());
+
+        let cli = Cli {
+            config_dir: Some(config_dir.path().to_path_buf()),
+            verbose: 0,
+            quiet: true,
+            command: Some(Command::SelfUpdate(SelfUpdateCommand {
+                version: Some("v1.2.3".into()),
+            })),
+        };
+
+        run(&cli).expect("run self-update");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_executes_internal_capture_arg_command() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().expect("temp dir");
+        let output = temp.child("prompt.txt");
+        let script = temp.child("provider.sh");
+        script
+            .write_str("#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\n")
+            .expect("write script");
+        let perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(script.path(), perms).expect("set executable");
+
+        let _capture_guard = EnvOverride::set_var("TX_CAPTURE_STDIN_DATA", "payload");
+
+        let cli = Cli {
+            config_dir: None,
+            verbose: 0,
+            quiet: false,
+            command: Some(Command::Internal(InternalCommand::CaptureArg(
+                InternalCaptureArgCommand {
+                    provider: "demo".into(),
+                    bin: script.path().display().to_string(),
+                    pre_commands: Vec::new(),
+                    provider_args: vec![output.path().display().to_string(), "{prompt}".into()],
+                    prompt_limit: 128,
+                },
+            ))),
+        };
+
+        run(&cli).expect("run internal capture-arg");
+
+        let contents = std::fs::read_to_string(output.path()).expect("read output");
+        assert_eq!(contents, "payload");
+    }
+
+    #[test]
+    fn run_returns_error_for_provider_mismatch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.child("config");
+        config_dir.create_dir_all().expect("create config dir");
+        let sessions_dir = config_dir.child("sessions");
+        sessions_dir.create_dir_all().expect("create sessions dir");
+        let config_toml = format!(
+            r#"
+provider = "demo"
+
+[providers.demo]
+bin = "echo"
+session_roots = ["{root}"]
+
+[profiles.default]
+provider = "demo"
+
+[profiles.alt]
+provider = "alt"
+        "#,
+            root = toml_path(sessions_dir.path()),
+        );
+        config_dir
+            .child("config.toml")
+            .write_str(&config_toml)
+            .expect("write config");
+
+        let data_dir = temp.child("data");
+        data_dir.create_dir_all().expect("create data dir");
+        let cache_dir = temp.child("cache");
+        cache_dir.create_dir_all().expect("create cache dir");
+
+        let _data_guard = EnvOverride::set_path("TX_DATA_DIR", data_dir.path());
+        let _cache_guard = EnvOverride::set_path("TX_CACHE_DIR", cache_dir.path());
+
+        let db_path = data_dir.child("tx.sqlite3");
+        let mut db = Database::open(db_path.path()).expect("open db");
+        let session_path = sessions_dir.child("sess-1.jsonl");
+        session_path
+            .write_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n")
+            .expect("write session");
+
+        let summary = SessionSummary {
+            id: "sess-1".into(),
+            provider: "demo".into(),
+            wrapper: None,
+            model: None,
+            label: Some("Demo".into()),
+            thread_name: None,
+            path: session_path.path().to_path_buf(),
+            uuid: Some("uuid-1".into()),
+            first_prompt: Some("Hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(0),
+            started_at: Some(0),
+            last_active: Some(0),
+            size: 1,
+            mtime: 0,
+        };
+        let mut message = MessageRecord::new(summary.id.clone(), 0, "user", "Hello", None, Some(0));
+        message.is_first = true;
+        db.upsert_session(&SessionIngest::new(summary.clone(), vec![message]))
+            .expect("upsert session");
+
+        let session_id = summary.id.clone();
+        let cli = Cli {
+            config_dir: Some(config_dir.path().to_path_buf()),
+            verbose: 0,
+            quiet: false,
+            command: Some(Command::Resume(ResumeCommand {
+                session_id,
+                profile: Some("alt".into()),
+                pre_snippets: Vec::new(),
+                post_snippets: Vec::new(),
+                wrap: None,
+                emit_command: false,
+                emit_json: false,
+                vars: Vec::new(),
+                dry_run: false,
+                provider_args: Vec::new(),
+            })),
+        };
+
+        let err = run(&cli).expect_err("expected provider mismatch error");
+        let message = err.to_string();
+        assert!(message.contains("provider mismatch"));
+    }
+}

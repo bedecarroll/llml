@@ -1,0 +1,9 @@
+#:schema https://tx.bedecarroll.com/assets/config-schema.json
+provider = "codex"
+terminal_title = "{{provider}}"
+
+[providers.codex]
+bin = "codex"
+flags = []
+stdin_mode = "capture_arg"
+stdin_to = "codex:{prompt}"

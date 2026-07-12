@@ -1,0 +1,2547 @@
+use std::fmt::Write;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
+
+use color_eyre::Result;
+use color_eyre::eyre::{self, Context, eyre};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
+
+use crate::session::{
+    MessageRecord, SearchHit, SessionIngest, SessionQuery, SessionSummary, TokenUsageRecord,
+    Transcript, is_subagent_job_session_texts, session_meta_source_is_subagent,
+    thread_name_update_from_value,
+};
+use crate::sqlite_ext;
+
+mod rag;
+
+pub use rag::*;
+
+const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION_V5: i32 = 5;
+const SCHEMA_VERSION_V6: i32 = 6;
+const SCHEMA_VERSION_V7: i32 = 7;
+const SCHEMA_VERSION_V8: i32 = 8;
+const SCHEMA_VERSION_V9: i32 = 9;
+const SCHEMA_VERSION_V10: i32 = 10;
+const V5_INDEXES_SQL: &str = r"
+    CREATE INDEX IF NOT EXISTS idx_sessions_provider_last_active ON sessions(provider, last_active);
+    CREATE INDEX IF NOT EXISTS idx_sessions_path ON sessions(path);
+    CREATE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions(uuid);
+    CREATE INDEX IF NOT EXISTS idx_messages_session_timestamp ON messages(session_id, timestamp);
+";
+
+type SessionBackfillRow = (String, String, Option<String>, bool);
+
+/// Encode an `f32` vector into `SQLite` BLOB form expected by sqlite-vec.
+#[must_use]
+pub fn f32s_to_blob(values: &[f32]) -> Vec<u8> {
+    bytemuck::cast_slice(values).to_vec()
+}
+
+pub struct Database {
+    conn: Connection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexedSession {
+    pub id: String,
+    pub path: PathBuf,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+impl IndexedSession {
+    #[must_use]
+    pub const fn is_stale(&self, size: i64, mtime: i64) -> bool {
+        self.size != size || self.mtime != mtime
+    }
+}
+
+fn assert_isolated_test_db_path(path: &Path) -> Result<()> {
+    if !is_test_harness_process() || test_db_path_is_isolated(path) {
+        return Ok(());
+    }
+
+    Err(eyre!(
+        "refusing to open database at {} from test harness; tests must use a temp directory or override TX_DATA_DIR/XDG_DATA_HOME",
+        path.display()
+    ))
+}
+
+fn is_test_harness_process() -> bool {
+    // Bazel test runners always set TEST_SRCDIR.
+    if std::env::var_os("TEST_SRCDIR").is_some() {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .and_then(|parent| parent.file_name().map(ToOwned::to_owned))
+        })
+        .is_some_and(|name| name == "deps" || name == "doctestbins")
+}
+
+fn test_db_path_is_isolated(path: &Path) -> bool {
+    if std::env::var_os("TX_ALLOW_LIVE_DB_IN_TESTS").is_some() {
+        return true;
+    }
+
+    let path = absolutize_path(path);
+    allowed_test_db_roots()
+        .into_iter()
+        .map(|root| absolutize_path(&root))
+        .any(|root| path.starts_with(root))
+}
+
+fn allowed_test_db_roots() -> Vec<PathBuf> {
+    let mut roots = vec![std::env::temp_dir()];
+    if let Some(path) = std::env::var_os("TX_DATA_DIR") {
+        roots.push(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
+        roots.push(PathBuf::from(path).join("tx"));
+    }
+    roots
+}
+
+fn absolutize_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+}
+
+impl Database {
+    /// Open or create the `SQLite` database at the given path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database file cannot be opened or initialized.
+    pub fn open(path: &Path) -> Result<Self> {
+        assert_isolated_test_db_path(path)?;
+        sqlite_ext::init_sqlite_extensions()?;
+        let conn = Connection::open(path)
+            .with_context(|| format!("failed to open database at {}", path.display()))?;
+        let db = Self { conn };
+        db.configure()?;
+        db.migrate()?;
+        Ok(db)
+    }
+
+    fn configure(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                r"
+                PRAGMA foreign_keys = ON;
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                PRAGMA temp_store = MEMORY;
+                PRAGMA mmap_size = 134217728;
+                ",
+            )
+            .context("failed to configure database pragmas")?;
+        Ok(())
+    }
+
+    fn migrate(&self) -> Result<()> {
+        sqlite_ext::init_sqlite_extensions()?;
+        let current: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        if current == SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        if current > SCHEMA_VERSION {
+            return Err(eyre!(
+                "database schema version {current} is newer than this binary supports ({SCHEMA_VERSION})"
+            ));
+        }
+
+        if current == 0 {
+            self.create_schema()?;
+            return Ok(());
+        }
+
+        if current < SCHEMA_VERSION_V5 {
+            self.migrate_to_v5()?;
+        }
+
+        if current < SCHEMA_VERSION_V6 {
+            self.migrate_to_v6()?;
+        }
+
+        (current < SCHEMA_VERSION_V7)
+            .then(|| self.migrate_to_v7())
+            .transpose()?;
+
+        (current < SCHEMA_VERSION_V8)
+            .then(|| self.migrate_to_v8())
+            .transpose()?;
+
+        (current < SCHEMA_VERSION_V9)
+            .then(|| self.migrate_to_v9())
+            .transpose()?;
+
+        (current < SCHEMA_VERSION_V10)
+            .then(|| self.migrate_to_v10())
+            .transpose()?;
+
+        (current < SCHEMA_VERSION)
+            .then(|| self.migrate_to_v11())
+            .transpose()?;
+
+        Ok(())
+    }
+
+    fn migrate_to_v5(&self) -> Result<()> {
+        let needs_wrapper = !self.has_column("sessions", "wrapper")?;
+
+        needs_wrapper
+            .then(|| {
+                self.conn
+                    .execute("ALTER TABLE sessions ADD COLUMN wrapper TEXT", [])
+            })
+            .transpose()?;
+        self.conn.execute_batch(V5_INDEXES_SQL)?;
+
+        self.conn
+            .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION_V5}"), [])?;
+        Ok(())
+    }
+
+    fn migrate_to_v6(&self) -> Result<()> {
+        let needs_model = !self.has_column("sessions", "model")?;
+
+        if needs_model {
+            self.conn
+                .execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])?;
+        }
+
+        self.conn
+            .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION_V6}"), [])?;
+        Ok(())
+    }
+
+    fn migrate_to_v7(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r"
+            CREATE TABLE IF NOT EXISTS token_usage (
+                session_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                model TEXT,
+                rate_limits TEXT,
+                PRIMARY KEY (
+                    session_id,
+                    timestamp,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    reasoning_output_tokens,
+                    total_tokens
+                ),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+            ",
+        )?;
+
+        self.conn
+            .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION_V7}"), [])?;
+        Ok(())
+    }
+
+    fn migrate_to_v8(&self) -> Result<()> {
+        let sql = r"
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_session_chunks USING vec0(
+                chunk_id INTEGER PRIMARY KEY,
+                embedding FLOAT[1536],
+                session_id TEXT PARTITION KEY,
+                ts_ms INTEGER,
+                tool_name TEXT,
+                kind TEXT,
+                model TEXT,
+                content_hash TEXT,
+                +text TEXT,
+                +source_event_id INTEGER
+            );
+            ";
+        self.conn.execute_batch(sql)?;
+        self.conn
+            .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION_V8}"), [])?;
+        Ok(())
+    }
+
+    fn migrate_to_v9(&self) -> Result<()> {
+        if !self.has_column("messages", "source_event_id")? {
+            let sql = "ALTER TABLE messages ADD COLUMN source_event_id INTEGER";
+            self.conn.execute(sql, [])?;
+        }
+        self.conn
+            .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION_V9}"), [])?;
+        Ok(())
+    }
+
+    fn migrate_to_v10(&self) -> Result<()> {
+        if !self.has_column("sessions", "subagent")? {
+            let add_subagent_column =
+                "ALTER TABLE sessions ADD COLUMN subagent INTEGER NOT NULL DEFAULT 0";
+            self.conn.execute(add_subagent_column, [])?;
+        }
+
+        let sessions = self.session_backfill_rows()?;
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE sessions SET actionable = ?2, subagent = ?3 WHERE id = ?1")?;
+        for (id, path, first_prompt, actionable) in sessions {
+            let subagent = session_log_indicates_subagent(Path::new(&path))?
+                .unwrap_or_else(|| is_subagent_job_session_texts(first_prompt.as_deref(), None));
+            let actionable = actionable && !subagent;
+            stmt.execute(params![id, i64::from(actionable), i64::from(subagent)])?;
+        }
+
+        self.conn
+            .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION_V10}"), [])?;
+        Ok(())
+    }
+
+    fn migrate_to_v11(&self) -> Result<()> {
+        if !self.has_column("sessions", "thread_name")? {
+            self.conn
+                .execute("ALTER TABLE sessions ADD COLUMN thread_name TEXT", [])?;
+        }
+
+        let sessions = self.session_backfill_rows()?;
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE sessions SET thread_name = ?2 WHERE id = ?1")?;
+        for (id, path, _, _) in sessions {
+            let thread_name = session_log_thread_name(Path::new(&path))?;
+            stmt.execute(params![id, thread_name])?;
+        }
+
+        self.conn
+            .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), [])?;
+        Ok(())
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let sql = format!("PRAGMA table_info({table})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name.eq_ignore_ascii_case(column) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn session_backfill_rows(&self) -> Result<Vec<SessionBackfillRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path, first_prompt, actionable FROM sessions")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn create_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r"
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                wrapper TEXT,
+                model TEXT,
+                label TEXT,
+                thread_name TEXT,
+                path TEXT NOT NULL,
+                uuid TEXT,
+                first_prompt TEXT,
+                actionable INTEGER NOT NULL DEFAULT 1,
+                subagent INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER,
+                started_at INTEGER,
+                last_active INTEGER,
+                size INTEGER NOT NULL DEFAULT 0,
+                mtime INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                session_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT,
+                timestamp INTEGER,
+                is_first INTEGER NOT NULL DEFAULT 0,
+                source_event_id INTEGER,
+                PRIMARY KEY (session_id, idx),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                session_id UNINDEXED,
+                role UNINDEXED,
+                content
+            );
+
+            CREATE TABLE IF NOT EXISTS token_usage (
+                session_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                model TEXT,
+                rate_limits TEXT,
+                PRIMARY KEY (
+                    session_id,
+                    timestamp,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    reasoning_output_tokens,
+                    total_tokens
+                ),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_provider_last_active ON sessions(provider, last_active);
+            CREATE INDEX IF NOT EXISTS idx_sessions_path ON sessions(path);
+            CREATE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions(uuid);
+            CREATE INDEX IF NOT EXISTS idx_messages_session_timestamp ON messages(session_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_session_chunks USING vec0(
+                chunk_id INTEGER PRIMARY KEY,
+                embedding FLOAT[1536],
+                session_id TEXT PARTITION KEY,
+                ts_ms INTEGER,
+                tool_name TEXT,
+                kind TEXT,
+                model TEXT,
+                content_hash TEXT,
+                +text TEXT,
+                +source_event_id INTEGER
+            );
+            ",
+        )?;
+
+        let pragma = format!("PRAGMA user_version = {SCHEMA_VERSION}");
+        self.conn.execute(&pragma, [])?;
+        Ok(())
+    }
+
+    /// Look up an existing session summary by on-disk path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SELECT query fails.
+    pub fn existing_by_path(&self, path: &str) -> Result<Option<SessionSummary>> {
+        self.conn
+            .prepare(
+                r"
+                SELECT
+                    id,
+                    provider,
+                    wrapper,
+                    model,
+                    label,
+                    thread_name,
+                    path,
+                    uuid,
+                    first_prompt,
+                    actionable,
+                    subagent,
+                    created_at,
+                    started_at,
+                    last_active,
+                    size,
+                    mtime
+                FROM sessions
+                WHERE path = ?1
+                ",
+            )?
+            .query_row([path], map_summary)
+            .optional()
+            .map_err(|err| eyre::eyre!("failed to query session by path: {err}"))
+    }
+
+    /// Insert or update a session and its messages in a single transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any insert or delete statement fails.
+    pub fn upsert_session(&mut self, ingest: &SessionIngest) -> Result<()> {
+        let tx = self.conn.transaction()?;
+
+        let s = &ingest.summary;
+        tx.execute(
+            r"
+            INSERT INTO sessions (
+                id,
+                provider,
+                wrapper,
+                model,
+                label,
+                thread_name,
+                path,
+                uuid,
+                first_prompt,
+                actionable,
+                subagent,
+                created_at,
+                started_at,
+                last_active,
+                size,
+                mtime
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ON CONFLICT(id) DO UPDATE SET
+                provider = excluded.provider,
+                wrapper = excluded.wrapper,
+                model = excluded.model,
+                label = excluded.label,
+                thread_name = excluded.thread_name,
+                path = excluded.path,
+                uuid = excluded.uuid,
+                first_prompt = excluded.first_prompt,
+                actionable = excluded.actionable,
+                subagent = excluded.subagent,
+                created_at = excluded.created_at,
+                started_at = excluded.started_at,
+                last_active = excluded.last_active,
+                size = excluded.size,
+                mtime = excluded.mtime
+            ",
+            params![
+                s.id,
+                s.provider,
+                s.wrapper.as_deref(),
+                s.model.as_deref(),
+                s.label.as_deref(),
+                s.thread_name.as_deref(),
+                s.path.to_string_lossy(),
+                s.uuid.as_deref(),
+                s.first_prompt.as_deref(),
+                i64::from(s.actionable),
+                i64::from(s.subagent),
+                s.created_at,
+                s.started_at,
+                s.last_active,
+                s.size,
+                s.mtime,
+            ],
+        )?;
+
+        clear_session_data(&tx, &s.id)?;
+        insert_messages(&tx, ingest)?;
+        insert_message_fts(&tx, ingest)?;
+        insert_token_usage(&tx, ingest)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// List all session summaries for the specified provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be executed.
+    pub fn sessions_for_provider(&self, provider: &str) -> Result<Vec<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT
+                id,
+                provider,
+                wrapper,
+                model,
+                label,
+                thread_name,
+                path,
+                uuid,
+                first_prompt,
+                actionable,
+                subagent,
+                created_at,
+                started_at,
+                last_active,
+                size,
+                mtime
+            FROM sessions
+            WHERE provider = ?1
+            ",
+        )?;
+        let rows = stmt.query_map([provider], map_summary)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// List the session fields needed to decide whether provider files changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be executed.
+    pub fn indexed_sessions_for_provider(&self, provider: &str) -> Result<Vec<IndexedSession>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT id, path, size, mtime
+            FROM sessions
+            WHERE provider = ?1
+            ",
+        )?;
+        let rows = stmt.query_map([provider], |row| {
+            Ok(IndexedSession {
+                id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                size: row.get(2)?,
+                mtime: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch token usage events for sessions owned by the specified provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token usage query fails.
+    pub fn token_usage_for_provider(&self, provider: &str) -> Result<Vec<TokenUsageRecord>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT
+                tu.session_id,
+                tu.timestamp,
+                tu.input_tokens,
+                tu.cached_input_tokens,
+                tu.output_tokens,
+                tu.reasoning_output_tokens,
+                tu.total_tokens,
+                tu.model,
+                tu.rate_limits
+            FROM token_usage tu
+            JOIN sessions s ON s.id = tu.session_id
+            WHERE s.provider = ?1
+            ",
+        )?;
+        let rows = stmt.query_map([provider], map_token_usage)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch timestamps for user messages for the specified provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn user_message_timestamps(&self, provider: &str) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT m.timestamp
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE s.provider = ?1
+              AND m.timestamp IS NOT NULL
+              AND lower(m.role) = 'user'
+            ",
+        )?;
+        let rows = stmt.query_map([provider], |row| row.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Remove a session and its associated data by identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete statement fails.
+    pub fn delete_session(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [id])
+            .with_context(|| format!("failed to delete session {id}"))?;
+        Ok(())
+    }
+
+    /// Count the number of indexed sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the count query fails.
+    pub fn count_sessions(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|err| eyre!("failed to count sessions: {err}"))
+    }
+
+    /// Retrieve a filtered list of sessions with optional provider, actionable, time, and limit filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query execution fails.
+    pub fn list_sessions(
+        &self,
+        provider: Option<&str>,
+        actionable_only: bool,
+        since_epoch: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SessionQuery>> {
+        let mut query = String::from(
+            "SELECT id, provider, wrapper, label, thread_name, first_prompt, actionable, subagent, last_active FROM sessions",
+        );
+        let mut clauses = Vec::new();
+        let mut params: Vec<SqlValue> = Vec::new();
+
+        if let Some(provider) = provider {
+            clauses.push("provider = ?");
+            params.push(SqlValue::from(provider.to_string()));
+        }
+
+        if actionable_only {
+            clauses.push("actionable = 1");
+        }
+
+        if let Some(since) = since_epoch {
+            clauses.push("last_active >= ?");
+            params.push(SqlValue::from(since));
+        }
+
+        if !clauses.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&clauses.join(" AND "));
+        }
+
+        query.push_str(" ORDER BY last_active DESC");
+
+        if let Some(limit) = limit {
+            let _ = write!(&mut query, " LIMIT {limit}");
+        }
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), map_query)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Visit filtered sessions in descending activity order until the visitor stops.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query execution fails or the visitor returns an error.
+    pub fn visit_sessions<F>(
+        &self,
+        provider: Option<&str>,
+        actionable_only: bool,
+        since_epoch: Option<i64>,
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(SessionQuery) -> Result<bool>,
+    {
+        let mut query = String::from(
+            "SELECT id, provider, wrapper, label, thread_name, first_prompt, actionable, subagent, last_active FROM sessions",
+        );
+        let mut clauses = Vec::new();
+        let mut params: Vec<SqlValue> = Vec::new();
+
+        if let Some(provider) = provider {
+            clauses.push("provider = ?");
+            params.push(SqlValue::from(provider.to_string()));
+        }
+
+        if actionable_only {
+            clauses.push("actionable = 1");
+        }
+
+        if let Some(since) = since_epoch {
+            clauses.push("last_active >= ?");
+            params.push(SqlValue::from(since));
+        }
+
+        if !clauses.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&clauses.join(" AND "));
+        }
+
+        query.push_str(" ORDER BY last_active DESC");
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params.iter()))?;
+        while let Some(row) = rows.next()? {
+            if !visitor(map_query(row)?)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Search sessions by first user prompt using a LIKE query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if executing the query or mapping results fails.
+    pub fn search_first_prompt(
+        &self,
+        term: &str,
+        provider: Option<&str>,
+        actionable_only: bool,
+    ) -> Result<Vec<SearchHit>> {
+        let mut query = String::from(
+            "SELECT id, provider, wrapper, label, NULL AS role, first_prompt, last_active, actionable FROM sessions WHERE first_prompt LIKE ?",
+        );
+        let mut params: Vec<SqlValue> = vec![SqlValue::from(format!("%{term}%"))];
+
+        if let Some(provider) = provider {
+            query.push_str(" AND provider = ?");
+            params.push(SqlValue::from(provider.to_string()));
+        }
+
+        if actionable_only {
+            query.push_str(" AND actionable = 1");
+        }
+
+        query.push_str(" ORDER BY last_active DESC");
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), map_search_hit)?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
+        }
+        Ok(hits)
+    }
+
+    /// Search sessions using the full-text index across message content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if executing the FTS query or mapping results fails.
+    pub fn search_full_text(
+        &self,
+        term: &str,
+        provider: Option<&str>,
+        actionable_only: bool,
+    ) -> Result<Vec<SearchHit>> {
+        let mut query = String::from(
+            r"
+            SELECT s.id, s.provider, s.wrapper, s.label, messages_fts.role, messages_fts.content, s.last_active, s.actionable
+            FROM messages_fts
+            JOIN sessions s ON s.id = messages_fts.session_id
+            WHERE messages_fts MATCH ?
+            ",
+        );
+        let mut params: Vec<SqlValue> = vec![SqlValue::from(term.to_string())];
+
+        if let Some(provider) = provider {
+            query.push_str(" AND s.provider = ?");
+            params.push(SqlValue::from(provider.to_string()));
+        }
+
+        if actionable_only {
+            query.push_str(" AND s.actionable = 1");
+        }
+
+        query.push_str(" ORDER BY s.last_active DESC");
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), map_search_hit)?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
+        }
+        Ok(hits)
+    }
+
+    /// Fetch the full transcript for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SQL query fails during retrieval.
+    pub fn fetch_transcript(&self, identifier: &str) -> Result<Option<Transcript>> {
+        let summary = if let Some(summary) = self.session_summary(identifier)? {
+            summary
+        } else {
+            let fallback = self.session_summary_by_uuid(identifier)?;
+            let Some(summary) = fallback else {
+                return Ok(None);
+            };
+            summary
+        };
+        let session_id = summary.id.clone();
+
+        let mut messages_stmt = self.conn.prepare(
+            "SELECT idx, source_event_id, role, content, source, timestamp, is_first FROM messages WHERE session_id = ?1 ORDER BY idx",
+        )?;
+        let message_rows = messages_stmt.query_map([session_id.clone()], |row| {
+            Ok(MessageRecord {
+                session_id: session_id.clone(),
+                index: row.get(0)?,
+                source_event_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                source: row.get(4)?,
+                timestamp: row.get(5)?,
+                is_first: row.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        let mut messages = Vec::new();
+        for row in message_rows {
+            messages.push(row?);
+        }
+
+        Ok(Some(Transcript {
+            session: summary,
+            messages,
+        }))
+    }
+
+    fn session_summary_by_uuid(&self, uuid: &str) -> Result<Option<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT
+                id,
+                provider,
+                wrapper,
+                model,
+                label,
+                thread_name,
+                path,
+                uuid,
+                first_prompt,
+                actionable,
+                subagent,
+                created_at,
+                started_at,
+                last_active,
+                size,
+                mtime
+            FROM sessions
+            WHERE uuid = ?1
+            ",
+        )?;
+        stmt.query_row([uuid], map_summary)
+            .optional()
+            .map_err(|err| eyre!("failed to fetch session summary for uuid {uuid}: {err}"))
+    }
+
+    /// Retrieve a session summary by identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn session_summary(&self, id: &str) -> Result<Option<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT
+                id,
+                provider,
+                wrapper,
+                model,
+                label,
+                thread_name,
+                path,
+                uuid,
+                first_prompt,
+                actionable,
+                subagent,
+                created_at,
+                started_at,
+                last_active,
+                size,
+                mtime
+            FROM sessions
+            WHERE id = ?1
+            ",
+        )?;
+        stmt.query_row([id], map_summary)
+            .optional()
+            .map_err(|err| eyre!("failed to fetch session summary for {id}: {err}"))
+    }
+
+    /// Retrieve a session summary by identifier, accepting either the internal ID or UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn session_summary_for_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<SessionSummary>> {
+        if let Some(summary) = self.session_summary(identifier)? {
+            return Ok(Some(summary));
+        }
+
+        self.session_summary_by_uuid(identifier)
+    }
+
+    /// Retrieve the most recently active actionable session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn latest_actionable_session(&self) -> Result<Option<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT
+                id,
+                provider,
+                wrapper,
+                model,
+                label,
+                thread_name,
+                path,
+                uuid,
+                first_prompt,
+                actionable,
+                subagent,
+                created_at,
+                started_at,
+                last_active,
+                size,
+                mtime
+            FROM sessions
+            WHERE actionable = 1 AND last_active IS NOT NULL
+            ORDER BY last_active DESC
+            LIMIT 1
+            ",
+        )?;
+
+        stmt.query_row([], map_summary)
+            .optional()
+            .map_err(|err| eyre!("failed to fetch latest session: {err}"))
+    }
+
+    /// Determine the provider associated with a session identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn provider_for(&self, id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT provider FROM sessions WHERE id = ?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|err| eyre!("failed to query provider for session {id}: {err}"))
+    }
+}
+
+fn clear_session_data(tx: &Transaction<'_>, session_id: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM messages WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    tx.execute(
+        "DELETE FROM messages_fts WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    tx.execute(
+        "DELETE FROM token_usage WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+fn insert_messages(tx: &Transaction<'_>, ingest: &SessionIngest) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO messages (session_id, idx, role, content, source, timestamp, is_first, source_event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for message in &ingest.messages {
+        stmt.execute(params![
+            message.session_id,
+            message.index,
+            message.role,
+            message.content,
+            message.source.as_deref(),
+            message.timestamp,
+            i64::from(message.is_first),
+            message.source_event_id.unwrap_or(message.index),
+        ])?;
+    }
+    Ok(())
+}
+
+fn insert_message_fts(tx: &Transaction<'_>, ingest: &SessionIngest) -> Result<()> {
+    let mut stmt =
+        tx.prepare("INSERT INTO messages_fts (session_id, role, content) VALUES (?1, ?2, ?3)")?;
+    for message in &ingest.messages {
+        stmt.execute(params![message.session_id, message.role, message.content])?;
+    }
+    Ok(())
+}
+
+fn insert_token_usage(tx: &Transaction<'_>, ingest: &SessionIngest) -> Result<()> {
+    if ingest.token_usage.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = tx.prepare(
+        r"
+        INSERT INTO token_usage (
+            session_id,
+            timestamp,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+            total_tokens,
+            model,
+            rate_limits
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ",
+    )?;
+    for usage in &ingest.token_usage {
+        stmt.execute(params![
+            usage.session_id,
+            usage.timestamp,
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+            usage.reasoning_output_tokens,
+            usage.total_tokens,
+            usage.model.as_deref(),
+            usage.rate_limits.as_deref(),
+        ])?;
+    }
+    Ok(())
+}
+
+fn map_summary(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
+    let path: String = row.get("path")?;
+    Ok(SessionSummary {
+        id: row.get("id")?,
+        provider: row.get("provider")?,
+        wrapper: row.get::<_, Option<String>>("wrapper")?,
+        model: row.get::<_, Option<String>>("model")?,
+        label: row.get::<_, Option<String>>("label")?,
+        thread_name: row.get::<_, Option<String>>("thread_name")?,
+        path: PathBuf::from(path),
+        uuid: row.get::<_, Option<String>>("uuid")?,
+        first_prompt: row.get::<_, Option<String>>("first_prompt")?,
+        actionable: row.get::<_, i64>("actionable")? != 0,
+        subagent: row.get::<_, i64>("subagent")? != 0,
+        created_at: row.get::<_, Option<i64>>("created_at")?,
+        started_at: row.get::<_, Option<i64>>("started_at")?,
+        last_active: row.get::<_, Option<i64>>("last_active")?,
+        size: row.get("size")?,
+        mtime: row.get("mtime")?,
+    })
+}
+
+fn map_query(row: &Row<'_>) -> rusqlite::Result<SessionQuery> {
+    Ok(SessionQuery {
+        id: row.get(0)?,
+        provider: row.get(1)?,
+        wrapper: row.get(2)?,
+        label: row.get(3)?,
+        thread_name: row.get(4)?,
+        first_prompt: row.get(5)?,
+        actionable: row.get::<_, i64>(6)? != 0,
+        subagent: row.get::<_, i64>(7)? != 0,
+        last_active: row.get(8)?,
+    })
+}
+
+fn map_search_hit(row: &Row<'_>) -> rusqlite::Result<SearchHit> {
+    Ok(SearchHit {
+        session_id: row.get(0)?,
+        provider: row.get(1)?,
+        wrapper: row.get(2)?,
+        label: row.get(3)?,
+        role: row.get(4)?,
+        snippet: row.get(5)?,
+        last_active: row.get::<_, Option<i64>>(6)?,
+        actionable: row.get::<_, i64>(7)? != 0,
+    })
+}
+
+fn map_token_usage(row: &Row<'_>) -> rusqlite::Result<TokenUsageRecord> {
+    Ok(TokenUsageRecord {
+        session_id: row.get(0)?,
+        timestamp: row.get(1)?,
+        input_tokens: row.get(2)?,
+        cached_input_tokens: row.get(3)?,
+        output_tokens: row.get(4)?,
+        reasoning_output_tokens: row.get(5)?,
+        total_tokens: row.get(6)?,
+        model: row.get(7)?,
+        rate_limits: row.get(8)?,
+    })
+}
+
+fn session_log_indicates_subagent(path: &Path) -> Result<Option<bool>> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(256) {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        return Ok(Some(session_meta_source_is_subagent(&value)));
+    }
+
+    Ok(None)
+}
+
+fn session_log_thread_name(path: &Path) -> Result<Option<String>> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut thread_name = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        let parsed = serde_json::from_str::<serde_json::Value>(line.trim()).ok();
+        thread_name = parsed
+            .as_ref()
+            .and_then(thread_name_update_from_value)
+            .unwrap_or(thread_name);
+    }
+
+    Ok(thread_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{ENV_LOCK, EnvOverride};
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
+    use rusqlite::{Connection, OpenFlags};
+    use std::path::PathBuf;
+    use time::OffsetDateTime;
+
+    const LEGACY_SCHEMA: &str = r"
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            label TEXT,
+            path TEXT NOT NULL,
+            uuid TEXT,
+            first_prompt TEXT,
+            actionable INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER,
+            started_at INTEGER,
+            last_active INTEGER,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            session_id TEXT NOT NULL,
+            idx INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT,
+            timestamp INTEGER,
+            is_first INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, idx),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            session_id UNINDEXED,
+            role UNINDEXED,
+            content
+        );
+
+        INSERT INTO sessions (
+            id,
+            provider,
+            label,
+            path,
+            uuid,
+            first_prompt,
+            actionable,
+            created_at,
+            started_at,
+            last_active,
+            size,
+            mtime
+        )
+        VALUES (
+            'sess-legacy',
+            'codex',
+            'Legacy',
+            'sess-legacy.jsonl',
+            NULL,
+            'Hello',
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+        );
+
+        PRAGMA user_version = 4;
+        ";
+
+    const V6_SCHEMA: &str = r"
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            wrapper TEXT,
+            model TEXT,
+            label TEXT,
+            path TEXT NOT NULL,
+            uuid TEXT,
+            first_prompt TEXT,
+            actionable INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER,
+            started_at INTEGER,
+            last_active INTEGER,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            session_id TEXT NOT NULL,
+            idx INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT,
+            timestamp INTEGER,
+            is_first INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, idx),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            session_id UNINDEXED,
+            role UNINDEXED,
+            content
+        );
+
+        PRAGMA user_version = 6;
+        ";
+
+    const V8_SCHEMA: &str = r"
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            wrapper TEXT,
+            model TEXT,
+            label TEXT,
+            path TEXT NOT NULL,
+            uuid TEXT,
+            first_prompt TEXT,
+            actionable INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER,
+            started_at INTEGER,
+            last_active INTEGER,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            session_id TEXT NOT NULL,
+            idx INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT,
+            timestamp INTEGER,
+            is_first INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, idx),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            session_id UNINDEXED,
+            role UNINDEXED,
+            content
+        );
+
+        CREATE TABLE IF NOT EXISTS token_usage (
+            session_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            model TEXT,
+            rate_limits TEXT,
+            PRIMARY KEY (
+                session_id,
+                timestamp,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
+                total_tokens
+            ),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_provider_last_active ON sessions(provider, last_active);
+        CREATE INDEX IF NOT EXISTS idx_sessions_path ON sessions(path);
+        CREATE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions(uuid);
+        CREATE INDEX IF NOT EXISTS idx_messages_session_timestamp ON messages(session_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_session_chunks USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding FLOAT[1536],
+            session_id TEXT PARTITION KEY,
+            ts_ms INTEGER,
+            tool_name TEXT,
+            kind TEXT,
+            model TEXT,
+            content_hash TEXT,
+            +text TEXT,
+            +source_event_id INTEGER
+        );
+
+        PRAGMA user_version = 8;
+        ";
+
+    fn create_db() -> Result<Database> {
+        sqlite_ext::init_sqlite_extensions()?;
+        let conn = Connection::open_in_memory()?;
+        let db = Database { conn };
+        db.configure()?;
+        db.migrate()?;
+        Ok(db)
+    }
+
+    fn insert_session(
+        db: &mut Database,
+        id: &str,
+        provider: &str,
+        prompt: &str,
+        actionable: bool,
+        now: i64,
+    ) -> Result<()> {
+        let summary = SessionSummary {
+            id: id.into(),
+            provider: provider.into(),
+            wrapper: None,
+            model: None,
+            label: Some(prompt.into()),
+            thread_name: None,
+            path: PathBuf::from(format!("{id}.jsonl")),
+            uuid: None,
+            first_prompt: Some(prompt.into()),
+            actionable,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+
+        let mut message =
+            MessageRecord::new(summary.id.clone(), 0, "user", prompt, None, Some(now));
+        message.is_first = true;
+        db.upsert_session(&SessionIngest::new(summary, vec![message]))?;
+        Ok(())
+    }
+
+    #[test]
+    fn full_text_search_is_case_insensitive() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let summary = SessionSummary {
+            id: "session-1".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("demo".into()),
+            thread_name: None,
+            path: PathBuf::from("session-1.jsonl"),
+            uuid: None,
+            first_prompt: Some("Context awareness request".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 42,
+            mtime: now,
+        };
+
+        let mut message = MessageRecord::new(
+            summary.id.clone(),
+            0,
+            "user",
+            "Context awareness should be case insensitive.",
+            None,
+            Some(now),
+        );
+        message.is_first = true;
+
+        let ingest = SessionIngest::new(summary.clone(), vec![message]);
+        db.upsert_session(&ingest)?;
+
+        let lower = db.search_full_text("context", None, false)?;
+        assert!(!lower.is_empty());
+        let lower_hit = lower
+            .iter()
+            .find(|hit| hit.session_id == summary.id)
+            .expect("summary should be present in lower-case search");
+        assert_eq!(lower_hit.role.as_deref(), Some("user"));
+        assert_eq!(
+            lower_hit.snippet.as_deref(),
+            Some("Context awareness should be case insensitive.")
+        );
+
+        let upper = db.search_full_text("Context", None, false)?;
+        assert!(!upper.is_empty());
+        assert_eq!(lower.len(), upper.len());
+        let upper_hit = upper
+            .iter()
+            .find(|hit| hit.session_id == summary.id)
+            .expect("summary should be present in upper-case search");
+        assert_eq!(upper_hit.role.as_deref(), Some("user"));
+        assert_eq!(
+            upper_hit.snippet.as_deref(),
+            Some("Context awareness should be case insensitive.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_first_prompt_filters_by_provider_and_actionable() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        insert_session(&mut db, "sess-1", "codex", "Shared context A", true, now)?;
+        insert_session(&mut db, "sess-2", "alt", "Shared context B", false, now)?;
+
+        let all = db.search_first_prompt("Shared", None, false)?;
+        assert_eq!(all.len(), 2);
+
+        let filtered = db.search_first_prompt("Shared", Some("codex"), false)?;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].provider, "codex");
+
+        let actionable_only = db.search_first_prompt("Shared", None, true)?;
+        assert_eq!(actionable_only.len(), 1);
+        assert_eq!(actionable_only[0].session_id, "sess-1");
+        Ok(())
+    }
+
+    #[test]
+    fn search_full_text_respects_actionable_flag() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        insert_session(&mut db, "sess-1", "codex", "Alpha prompt", true, now)?;
+        insert_session(&mut db, "sess-2", "codex", "Beta prompt", false, now)?;
+
+        let matches = db.search_full_text("prompt", None, false)?;
+        assert_eq!(matches.len(), 2);
+
+        let actionable = db.search_full_text("prompt", None, true)?;
+        assert_eq!(actionable.len(), 1);
+        assert_eq!(actionable[0].session_id, "sess-1");
+        Ok(())
+    }
+
+    #[test]
+    fn database_open_initializes_and_reuses_schema() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.child("tx.sqlite3");
+
+        {
+            let db = Database::open(db_path.path())?;
+            assert_eq!(db.count_sessions()?, 0);
+        }
+
+        let db = Database::open(db_path.path())?;
+        assert_eq!(db.count_sessions()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_by_path_and_sessions_for_provider() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        insert_session(&mut db, "sess-1", "codex", "Prompt", true, now)?;
+        insert_session(&mut db, "sess-2", "alt", "Other", true, now)?;
+
+        let summary = db
+            .existing_by_path("sess-1.jsonl")?
+            .expect("expected summary");
+        assert_eq!(summary.id, "sess-1");
+
+        let sessions = db.sessions_for_provider("codex")?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "sess-1");
+
+        let indexed_sessions = db.indexed_sessions_for_provider("codex")?;
+        assert_eq!(indexed_sessions.len(), 1);
+        assert_eq!(indexed_sessions[0].id, "sess-1");
+        assert_eq!(indexed_sessions[0].path, PathBuf::from("sess-1.jsonl"));
+        assert!(indexed_sessions[0].size > 0);
+        assert_eq!(indexed_sessions[0].mtime, now);
+        Ok(())
+    }
+
+    #[test]
+    fn token_usage_and_prompt_timestamps_are_scoped_to_provider() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        let summary = SessionSummary {
+            id: "sess-1".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("Usage".into()),
+            thread_name: None,
+            path: PathBuf::from("sess-1.jsonl"),
+            uuid: None,
+            first_prompt: Some("Hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let message = MessageRecord::new(summary.id.clone(), 0, "user", "Hello", None, Some(now));
+        let usage = TokenUsageRecord {
+            session_id: summary.id.clone(),
+            timestamp: now,
+            input_tokens: 10,
+            cached_input_tokens: 0,
+            output_tokens: 5,
+            reasoning_output_tokens: 0,
+            total_tokens: 15,
+            model: Some("gpt-5".into()),
+            rate_limits: None,
+        };
+        db.upsert_session(
+            &SessionIngest::new(summary.clone(), vec![message]).with_token_usage(vec![usage]),
+        )
+        .expect("insert session with usage");
+
+        let other_summary = SessionSummary {
+            id: "sess-2".into(),
+            provider: "alt".into(),
+            wrapper: None,
+            model: None,
+            label: Some("Other".into()),
+            thread_name: None,
+            path: PathBuf::from("sess-2.jsonl"),
+            uuid: None,
+            first_prompt: Some("Hi".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let other_message =
+            MessageRecord::new(other_summary.id.clone(), 0, "user", "Hi", None, Some(now));
+        db.upsert_session(&SessionIngest::new(
+            other_summary.clone(),
+            vec![other_message],
+        ))?;
+
+        let usage_rows = db.token_usage_for_provider("codex")?;
+        assert_eq!(usage_rows.len(), 1);
+        assert_eq!(usage_rows[0].session_id, "sess-1");
+
+        let timestamps = db.user_message_timestamps("codex")?;
+        assert_eq!(timestamps, vec![now]);
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_applies_filters() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        insert_session(&mut db, "fresh", "codex", "Recent", true, now)?;
+        insert_session(&mut db, "stale", "codex", "Older", true, now - 86_400)?;
+        insert_session(&mut db, "inactive", "codex", "Skip", false, now)?;
+
+        let recent = db.list_sessions(Some("codex"), true, Some(now - 1), Some(10))?;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, "fresh");
+
+        let limited = db.list_sessions(None, false, None, Some(1))?;
+        assert_eq!(limited.len(), 1, "limit should restrict rows");
+        assert_eq!(limited[0].id, "fresh");
+
+        let mut visited = Vec::new();
+        db.visit_sessions(Some("codex"), true, None, |session| {
+            visited.push(session.id);
+            Ok(false)
+        })?;
+        assert_eq!(visited, vec!["fresh"]);
+        Ok(())
+    }
+
+    #[test]
+    fn session_summary_for_identifier_uses_uuid() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let summary = SessionSummary {
+            id: "sess-uuid".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("UUID".into()),
+            thread_name: None,
+            path: PathBuf::from("sess-uuid.jsonl"),
+            uuid: Some("abc-123".into()),
+            first_prompt: Some("Hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let mut message =
+            MessageRecord::new(summary.id.clone(), 0, "user", "Hello", None, Some(now));
+        message.is_first = true;
+        db.upsert_session(&SessionIngest::new(summary.clone(), vec![message]))?;
+
+        assert!(db.session_summary("missing")?.is_none());
+        let fetched = db
+            .session_summary_for_identifier("abc-123")?
+            .expect("expected lookup by uuid");
+        assert_eq!(fetched.id, summary.id);
+
+        assert_eq!(db.provider_for("sess-uuid")?, Some("codex".into()));
+        assert!(db.provider_for("missing")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn latest_actionable_session_ignores_inactive_entries() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        insert_session(&mut db, "old", "codex", "Old", true, now - 10)?;
+        insert_session(&mut db, "inactive", "codex", "Inactive", false, now + 20)?;
+        insert_session(&mut db, "recent", "codex", "Recent", true, now)?;
+
+        let latest = db
+            .latest_actionable_session()?
+            .expect("expected a latest session");
+        assert_eq!(latest.id, "recent");
+
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_session_preserves_wrapper() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let summary = SessionSummary {
+            id: "sess-wrap".into(),
+            provider: "codex".into(),
+            wrapper: Some("shellwrap".into()),
+            model: None,
+            label: Some("Wrapped".into()),
+            thread_name: None,
+            path: PathBuf::from("sess-wrap.jsonl"),
+            uuid: None,
+            first_prompt: Some("Hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let mut message =
+            MessageRecord::new(summary.id.clone(), 0, "user", "Hello", None, Some(now));
+        message.is_first = true;
+
+        db.upsert_session(&SessionIngest::new(summary.clone(), vec![message]))?;
+
+        let stored = db.session_summary("sess-wrap")?.expect("stored summary");
+        assert_eq!(stored.wrapper.as_deref(), Some("shellwrap"));
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_session_replaces_existing_messages_and_usage_rows() {
+        let mut db = create_db().expect("create db");
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        let summary = SessionSummary {
+            id: "sess-replace".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("replace".into()),
+            thread_name: None,
+            path: PathBuf::from("sess-replace.jsonl"),
+            uuid: None,
+            first_prompt: Some("hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+
+        let mut first_message =
+            MessageRecord::new(summary.id.clone(), 0, "user", "first", None, Some(now));
+        first_message.is_first = true;
+        let first_usage = TokenUsageRecord {
+            session_id: summary.id.clone(),
+            timestamp: now,
+            input_tokens: 10,
+            cached_input_tokens: 0,
+            output_tokens: 5,
+            reasoning_output_tokens: 0,
+            total_tokens: 15,
+            model: Some("gpt-5".into()),
+            rate_limits: None,
+        };
+        db.upsert_session(
+            &SessionIngest::new(summary.clone(), vec![first_message.clone()])
+                .with_token_usage(vec![first_usage]),
+        )
+        .expect("insert first snapshot");
+
+        let mut second_message =
+            MessageRecord::new(summary.id.clone(), 0, "user", "second", None, Some(now + 1));
+        second_message.is_first = true;
+        let assistant_message = MessageRecord::new(
+            summary.id.clone(),
+            1,
+            "assistant",
+            "response",
+            None,
+            Some(now + 2),
+        );
+        let second_usage = TokenUsageRecord {
+            session_id: summary.id.clone(),
+            timestamp: now + 1,
+            input_tokens: 20,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+            reasoning_output_tokens: 0,
+            total_tokens: 30,
+            model: Some("gpt-5".into()),
+            rate_limits: None,
+        };
+        db.upsert_session(
+            &SessionIngest::new(summary, vec![second_message, assistant_message])
+                .with_token_usage(vec![second_usage]),
+        )
+        .expect("replace snapshot");
+
+        let transcript = db
+            .fetch_transcript("sess-replace")
+            .expect("fetch transcript")
+            .expect("transcript exists");
+        assert_eq!(transcript.messages.len(), 2);
+        assert_eq!(transcript.messages[0].content, "second");
+        assert_eq!(transcript.messages[1].content, "response");
+
+        let usage_rows = db
+            .token_usage_for_provider("codex")
+            .expect("query token usage");
+        let matching: Vec<_> = usage_rows
+            .into_iter()
+            .filter(|usage| usage.session_id == "sess-replace")
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].timestamp, now + 1);
+    }
+
+    #[test]
+    fn upsert_session_persists_model() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let summary = SessionSummary {
+            id: "sess-model".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: Some("o3-mini".into()),
+            label: Some("Model".into()),
+            thread_name: None,
+            path: PathBuf::from("sess-model.jsonl"),
+            uuid: None,
+            first_prompt: Some("Hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let mut message =
+            MessageRecord::new(summary.id.clone(), 0, "user", "Hello", None, Some(now));
+        message.is_first = true;
+
+        db.upsert_session(&SessionIngest::new(summary.clone(), vec![message]))?;
+
+        let stored = db.session_summary("sess-model")?.expect("stored summary");
+        assert_eq!(stored.model.as_deref(), Some("o3-mini"));
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_adds_wrapper_and_model_without_dropping_sessions() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.child("tx.sqlite3");
+
+        {
+            let conn = Connection::open(db_path.path())?;
+            conn.execute_batch(LEGACY_SCHEMA)?;
+        }
+
+        let db = Database::open(db_path.path())?;
+        let summary = db
+            .session_summary("sess-legacy")?
+            .expect("legacy summary should exist");
+        assert_eq!(summary.wrapper, None);
+        assert_eq!(summary.model, None);
+
+        let mut stmt = db.conn.prepare("PRAGMA table_info(sessions)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(columns.iter().any(|name| name == "wrapper"));
+        assert!(columns.iter().any(|name| name == "model"));
+
+        let token_usage_exists: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'token_usage'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        assert!(token_usage_exists.is_some());
+
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version, SCHEMA_VERSION);
+
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v4_schema_executes_v5_index_and_v7_paths() -> Result<()> {
+        sqlite_ext::init_sqlite_extensions()?;
+        let conn = Connection::open_in_memory()?;
+        let db = Database { conn };
+        db.configure()?;
+        db.conn.execute_batch(LEGACY_SCHEMA)?;
+
+        db.migrate()?;
+
+        assert!(db.has_column("sessions", "wrapper")?);
+        let idx_messages: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_session_timestamp'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        assert_eq!(
+            idx_messages.as_deref(),
+            Some("idx_messages_session_timestamp")
+        );
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn has_column_returns_true_for_existing_columns() -> Result<()> {
+        let db = create_db()?;
+        assert!(db.has_column("sessions", "provider")?);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_handles_intermediate_schema_versions() -> Result<()> {
+        let db = create_db()?;
+
+        db.conn.execute("PRAGMA user_version = 5", [])?;
+        db.migrate()?;
+        let version_after_v5: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version_after_v5, SCHEMA_VERSION);
+
+        db.conn.execute("PRAGMA user_version = 6", [])?;
+        db.migrate()?;
+        let version_after_v6: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version_after_v6, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v8_schema_adds_source_event_id_column() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.child("v8.sqlite3");
+        sqlite_ext::init_sqlite_extensions()?;
+        {
+            let conn = Connection::open(db_path.path())?;
+            conn.execute_batch(V8_SCHEMA)?;
+        }
+
+        let db = Database::open(db_path.path())?;
+        assert!(db.has_column("messages", "source_event_id")?);
+
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v9_schema_backfills_subagent_flag_and_hides_session() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.child("v9.sqlite3");
+        let session_path = temp.child("subagent.jsonl");
+        session_path.write_str("{\"type\":\"session_meta\",\"payload\":{\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Normal looking prompt\"}}\n")?;
+        sqlite_ext::init_sqlite_extensions()?;
+        {
+            let conn = Connection::open(db_path.path())?;
+            conn.execute_batch(V8_SCHEMA)?;
+            let add_source_event_id = "ALTER TABLE messages ADD COLUMN source_event_id INTEGER";
+            conn.execute(add_source_event_id, [])?;
+            conn.execute("PRAGMA user_version = 9", [])?;
+            conn.execute(
+                "INSERT INTO sessions (id, provider, wrapper, model, label, path, uuid, first_prompt, actionable, created_at, started_at, last_active, size, mtime) VALUES (?1, 'codex', NULL, NULL, 'Subagent', ?2, NULL, 'Normal looking prompt', 1, 1, 1, 1, 1, 1)",
+                params!["sess-subagent", session_path.path().to_string_lossy()])?;
+        }
+
+        let db = Database::open(db_path.path())?;
+        let summary = db
+            .session_summary("sess-subagent")?
+            .expect("session summary after migration");
+        assert!(summary.subagent);
+        assert!(!summary.actionable);
+        assert!(db.has_column("sessions", "subagent")?);
+
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn session_log_indicates_subagent_handles_blank_invalid_and_missing_meta() -> Result<()> {
+        let temp = TempDir::new()?;
+
+        let blank_and_invalid = temp.child("blank-and-invalid.jsonl");
+        blank_and_invalid.write_str("\n{not-json}\n")?;
+        assert_eq!(
+            session_log_indicates_subagent(blank_and_invalid.path())?,
+            None
+        );
+
+        let non_meta = temp.child("non-meta.jsonl");
+        let non_meta_event = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n";
+        non_meta.write_str(non_meta_event)?;
+        assert_eq!(session_log_indicates_subagent(non_meta.path())?, None);
+
+        let top_level = temp.child("top-level.jsonl");
+        top_level.write_str("{\"type\":\"session_meta\",\"payload\":{\"source\":\"cli\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n")?;
+        assert_eq!(
+            session_log_indicates_subagent(top_level.path())?,
+            Some(false)
+        );
+
+        let subagent = temp.child("subagent-meta.jsonl");
+        subagent.write_str("{\"type\":\"session_meta\",\"payload\":{\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n")?;
+        assert_eq!(session_log_indicates_subagent(subagent.path())?, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn session_log_thread_name_handles_blank_invalid_and_updates() -> Result<()> {
+        let temp = TempDir::new()?;
+        let session = temp.child("thread-name.jsonl");
+        let contents = [
+            "\nnot-json\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"sess-1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_name_updated\",\"thread_name\":\"tax\"}}\n",
+        ]
+        .concat();
+        session.write_str(&contents)?;
+
+        assert_eq!(
+            session_log_thread_name(session.path())?,
+            Some("tax".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_fails_on_read_only_create_schema() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.child("readonly-create.sqlite3");
+        {
+            let conn = Connection::open(db_path.path())?;
+            drop(conn);
+        }
+        let conn = Connection::open_with_flags(db_path.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let db = Database { conn };
+        let err = db.migrate().expect_err("read-only migrate should fail");
+        assert!(err.to_string().contains("readonly"));
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_fails_on_read_only_v7_upgrade() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.child("readonly-v7.sqlite3");
+        {
+            let conn = Connection::open(db_path.path())?;
+            conn.execute_batch(V6_SCHEMA)?;
+        }
+        let conn = Connection::open_with_flags(db_path.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let db = Database { conn };
+        let err = db.migrate().expect_err("read-only upgrade should fail");
+        assert!(err.to_string().contains("readonly"));
+        Ok(())
+    }
+
+    #[test]
+    fn database_open_rejects_newer_schema_versions() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.child("future.sqlite3");
+        let conn = Connection::open(db_path.path())?;
+        conn.execute_batch("PRAGMA user_version = 999;")?;
+        drop(conn);
+
+        let result = Database::open(db_path.path());
+        assert!(result.is_err());
+        let err = result.err().expect("future schema should fail");
+        assert!(
+            err.to_string()
+                .contains("is newer than this binary supports")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_harness_db_guard_rejects_non_temp_default_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _data_override = EnvOverride::remove("TX_DATA_DIR");
+        let _xdg_override = EnvOverride::remove("XDG_DATA_HOME");
+
+        #[cfg(windows)]
+        let path = PathBuf::from(r"C:\Users\example\AppData\Local\tx\tx.sqlite3");
+        #[cfg(not(windows))]
+        let path = PathBuf::from("/home/example/.local/share/tx/tx.sqlite3");
+
+        let err = assert_isolated_test_db_path(&path).expect_err("live path should be rejected");
+        assert!(err.to_string().contains("refusing to open database"));
+    }
+
+    #[test]
+    fn test_harness_db_guard_allows_temp_and_overridden_paths() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new()?;
+        let temp_db_path = temp.child("tx.sqlite3");
+        assert!(assert_isolated_test_db_path(temp_db_path.path()).is_ok());
+
+        let data_dir = temp.child("data-root");
+        data_dir.create_dir_all()?;
+        let _data_override = EnvOverride::set_path("TX_DATA_DIR", data_dir.path());
+        let overridden_db_path = data_dir.child("custom.sqlite3");
+        assert!(assert_isolated_test_db_path(overridden_db_path.path()).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_harness_db_guard_allows_xdg_data_home_tx_paths() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new()?;
+        let _data_override = EnvOverride::remove("TX_DATA_DIR");
+        let _xdg_override = EnvOverride::set_path("XDG_DATA_HOME", temp.path());
+        let xdg_db_path = temp.child("tx").child("tx.sqlite3");
+        assert!(assert_isolated_test_db_path(xdg_db_path.path()).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_harness_db_guard_allows_explicit_override_for_non_temp_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _data_override = EnvOverride::remove("TX_DATA_DIR");
+        let _xdg_override = EnvOverride::remove("XDG_DATA_HOME");
+        let _allow_override = EnvOverride::set_var("TX_ALLOW_LIVE_DB_IN_TESTS", "1");
+
+        #[cfg(windows)]
+        let path = PathBuf::from(r"C:\Users\example\AppData\Local\tx\tx.sqlite3");
+        #[cfg(not(windows))]
+        let path = PathBuf::from("/home/example/.local/share/tx/tx.sqlite3");
+
+        assert!(assert_isolated_test_db_path(&path).is_ok());
+    }
+
+    #[test]
+    fn absolutize_path_expands_relative_paths() {
+        let relative = Path::new("relative-db.sqlite3");
+        let absolute = absolutize_path(relative);
+        assert!(absolute.is_absolute());
+        assert!(absolute.ends_with(relative));
+    }
+
+    #[test]
+    fn query_methods_return_errors_when_sessions_table_is_missing() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        insert_session(&mut db, "sess-1", "codex", "Prompt", true, now)?;
+
+        db.conn
+            .execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE sessions;")?;
+
+        assert!(db.existing_by_path("sess-1.jsonl").is_err());
+        assert!(db.sessions_for_provider("codex").is_err());
+        assert!(db.indexed_sessions_for_provider("codex").is_err());
+        assert!(db.token_usage_for_provider("codex").is_err());
+        assert!(db.user_message_timestamps("codex").is_err());
+        assert!(db.session_summary_by_uuid("missing").is_err());
+        assert!(db.session_summary("sess-1").is_err());
+        assert!(db.latest_actionable_session().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_transcript_returns_none_for_unknown_identifier() -> Result<()> {
+        let db = create_db()?;
+        assert!(db.fetch_transcript("missing")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_transcript_by_id_returns_messages() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let summary = SessionSummary {
+            id: "direct-id".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("By ID".into()),
+            thread_name: None,
+            path: PathBuf::from("direct-id.jsonl"),
+            uuid: Some("direct-id-uuid".into()),
+            first_prompt: Some("hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let mut message =
+            MessageRecord::new(summary.id.clone(), 0, "user", "hello", None, Some(now));
+        message.is_first = true;
+        db.upsert_session(&SessionIngest::new(summary, vec![message]))?;
+
+        let transcript = db
+            .fetch_transcript("direct-id")?
+            .expect("expected transcript by id");
+        assert_eq!(transcript.session.id, "direct-id");
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0].content, "hello");
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_transcript_returns_error_when_messages_table_is_missing() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        insert_session(&mut db, "sess-1", "codex", "Prompt", true, now)?;
+        db.conn
+            .execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE messages;")?;
+
+        assert!(db.fetch_transcript("sess-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_session_errors_for_duplicate_message_indices() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let summary = SessionSummary {
+            id: "dup-msg".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("dup".into()),
+            thread_name: None,
+            path: PathBuf::from("dup-msg.jsonl"),
+            uuid: None,
+            first_prompt: Some("hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let first = MessageRecord::new(summary.id.clone(), 0, "user", "a", None, Some(now));
+        let second = MessageRecord::new(summary.id.clone(), 0, "assistant", "b", None, Some(now));
+        let ingest = SessionIngest::new(summary, vec![first, second]);
+        assert!(db.upsert_session(&ingest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_session_errors_for_duplicate_token_usage_rows() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let summary = SessionSummary {
+            id: "dup-usage".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("dup".into()),
+            thread_name: None,
+            path: PathBuf::from("dup-usage.jsonl"),
+            uuid: None,
+            first_prompt: Some("hello".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let message = MessageRecord::new(summary.id.clone(), 0, "user", "a", None, Some(now));
+        let usage = TokenUsageRecord {
+            session_id: summary.id.clone(),
+            timestamp: now,
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            output_tokens: 1,
+            reasoning_output_tokens: 0,
+            total_tokens: 2,
+            model: Some("gpt-5".into()),
+            rate_limits: None,
+        };
+        let ingest =
+            SessionIngest::new(summary, vec![message]).with_token_usage(vec![usage.clone(), usage]);
+        assert!(db.upsert_session(&ingest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_transcript_uses_uuid_fallback() -> Result<()> {
+        let mut db = create_db()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let summary = SessionSummary {
+            id: "uuid-session".into(),
+            provider: "codex".into(),
+            wrapper: None,
+            model: None,
+            label: Some("By UUID".into()),
+            thread_name: None,
+            path: PathBuf::from("uuid-session.jsonl"),
+            uuid: Some("uuid-lookup".into()),
+            first_prompt: Some("payload".into()),
+            actionable: true,
+            subagent: false,
+            created_at: Some(now),
+            started_at: Some(now),
+            last_active: Some(now),
+            size: 1,
+            mtime: now,
+        };
+        let mut message =
+            MessageRecord::new(summary.id.clone(), 0, "user", "payload", None, Some(now));
+        message.is_first = true;
+        message.source_event_id = Some(42);
+        db.upsert_session(&SessionIngest::new(summary, vec![message]))?;
+
+        let transcript = db
+            .fetch_transcript("uuid-lookup")?
+            .expect("expected transcript via uuid fallback");
+        assert_eq!(transcript.session.id, "uuid-session");
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0].source_event_id, Some(42));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_initialization_creates_vec_table() -> Result<()> {
+        let db = create_db()?;
+
+        let vec_table_exists: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'vec_session_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        assert_eq!(vec_table_exists.as_deref(), Some("vec_session_chunks"));
+        Ok(())
+    }
+
+    #[test]
+    fn vec_table_knn_query_returns_closest_chunk() -> Result<()> {
+        let mut db = create_db()?;
+        let mut exact = vec![0.0_f32; 1536];
+        exact[0] = 1.0;
+        let mut nearby = vec![0.0_f32; 1536];
+        nearby[0] = 0.75;
+        nearby[1] = 0.25;
+
+        db.upsert_rag_chunks(&[
+            RagChunkRecord {
+                chunk_id: 1,
+                embedding: exact.clone(),
+                session_id: "sess-a".to_string(),
+                ts_ms: 1,
+                tool_name: Some("event_msg".to_string()),
+                kind: "user".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                content_hash: "hash-a".to_string(),
+                text: "exact".to_string(),
+                source_event_id: 1,
+            },
+            RagChunkRecord {
+                chunk_id: 2,
+                embedding: nearby,
+                session_id: "sess-a".to_string(),
+                ts_ms: 2,
+                tool_name: Some("event_msg".to_string()),
+                kind: "assistant".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                content_hash: "hash-b".to_string(),
+                text: "nearby".to_string(),
+                source_event_id: 2,
+            },
+        ])?;
+
+        let nearest = db.search_similar_chunks(&exact, &RagSearchFilters::default(), 1)?;
+        assert_eq!(nearest.len(), 1);
+        assert_eq!(nearest[0].chunk_id, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn search_similar_chunks_applies_session_filter() -> Result<()> {
+        let mut db = create_db()?;
+        let mut exact = vec![0.0_f32; 1536];
+        exact[0] = 1.0;
+
+        db.upsert_rag_chunks(&[
+            RagChunkRecord {
+                chunk_id: 11,
+                embedding: exact.clone(),
+                session_id: "sess-a".to_string(),
+                ts_ms: 1,
+                tool_name: Some("event_msg".to_string()),
+                kind: "user".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                content_hash: "hash-a".to_string(),
+                text: "alpha".to_string(),
+                source_event_id: 1,
+            },
+            RagChunkRecord {
+                chunk_id: 22,
+                embedding: exact.clone(),
+                session_id: "sess-b".to_string(),
+                ts_ms: 2,
+                tool_name: Some("event_msg".to_string()),
+                kind: "assistant".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                content_hash: "hash-b".to_string(),
+                text: "beta".to_string(),
+                source_event_id: 2,
+            },
+        ])?;
+
+        let filters = RagSearchFilters {
+            session_id: Some("sess-b".to_string()),
+            tool_name: None,
+            since_ts_ms: None,
+            until_ts_ms: None,
+        };
+        let hits = db.search_similar_chunks(&exact, &filters, 10)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "sess-b");
+        Ok(())
+    }
+}

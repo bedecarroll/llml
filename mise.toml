@@ -1,0 +1,104 @@
+min_version = "2025.9.10"
+
+[tools]
+"cargo:cargo-deny" = "latest"
+"cargo:cargo-nextest" = "latest"
+"cargo:cargo-insta" = "latest"
+"cargo:cargo-llvm-cov" = "latest"
+"cargo:cargo-update" = "latest"
+
+[tasks.fmt]
+description = "Format all source files"
+run = ["cargo fmt --all"]
+
+[tasks.lint]
+description = "Clippy (pedantic), typos, markdown lint, and dependency audit"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --all-targets --all-features -- -D warnings",
+  "typos",
+  "markdownlint-cli2 \"**/*.md\" \"#target\" \"#coverage\" \"#dist\"",
+  "mise x cargo:cargo-deny -- cargo-deny check",
+]
+
+[tasks.lint-fix]
+description = "Auto-fix formatting, spelling, and markdown issues"
+run = [
+  "cargo fmt --all",
+  "typos -w",
+  "markdownlint-cli2 --fix \"**/*.md\" \"#target\" \"#coverage\" \"#dist\"",
+]
+
+[tasks.test]
+description = "Run the nextest test suite with coverage instrumentation"
+run = [
+  "cargo llvm-cov nextest --workspace --all-targets --profile ci",
+  "cargo insta test",
+]
+[tasks.check]
+description = "Aggregate format, lint, test, and doctest runs"
+depends = ["fmt", "lint", "test", "test-doc"]
+
+[tasks.test-doc]
+description = "Run Rust doctests"
+run = ["cargo test --doc"]
+
+[tasks.coverage]
+description = "Generate HTML and lcov coverage reports"
+run = [
+  "cargo llvm-cov clean --workspace",
+  "cargo llvm-cov nextest --workspace --all-targets --ignore-filename-regex 'src/(app|tui)/tests\\.rs$' --fail-under-lines 90 --html --output-dir coverage/html --profile ci",
+  "cargo llvm-cov report --summary-only --ignore-filename-regex 'src/(app|tui)/tests\\.rs$'",
+  "cargo llvm-cov report --lcov --output-path coverage/lcov.info --ignore-filename-regex 'src/(app|tui)/tests\\.rs$'",
+  "bash scripts/check_lcov_lines.sh coverage/lcov.info",
+]
+
+[tasks.bench]
+description = "Run Criterion benchmarks"
+run = ["cargo bench --features benchmarks --bench pipeline"]
+
+[tasks.pkg-install]
+description = "Install the CLI locally via cargo"
+run = ["cargo install --path . --force"]
+
+[tasks.generate-completions]
+description = "Generate shell completions into docs/completions"
+run = [
+  "cargo run --bin tx -- completions bash --dir docs/completions",
+  "cargo run --bin tx -- completions zsh --dir docs/completions",
+  "cargo run --bin tx -- completions fish --dir docs/completions",
+  "cargo run --bin tx -- completions powershell --dir docs/completions",
+  "cargo run --bin tx -- completions elvish --dir docs/completions",
+]
+
+[tasks.generate-manpage]
+description = "Render the CLI man page into docs/man"
+run = ["cargo run --bin tx -- manpage --dir docs/man"]
+
+[tasks.doc]
+description = "Build API docs and open them in a browser"
+run = ["cargo doc --no-deps --open"]
+
+[tasks.dist-init]
+description = "Initialise cargo-dist configuration"
+run = ["cargo dist init"]
+
+[tasks.dist-plan]
+description = "Plan the next cargo-dist release"
+run = ["cargo dist plan"]
+
+[tasks.dist-build]
+description = "Build release artefacts with cargo-dist"
+run = ["cargo dist build"]
+
+[tasks.snapshot]
+description = "Run insta snapshot tests"
+run = ["cargo insta test"]
+
+[tasks.snapshot-review]
+description = "Interactively review insta snapshot updates"
+run = ["cargo insta review"]
+
+[tasks.dist-doc]
+description = "Explain how to configure cargo-dist"
+run = ["cat docs/src/reference/releasing.md"]

@@ -1,0 +1,146 @@
+[[bench]]
+name = "pipeline"
+harness = false
+required-features = [ "benchmarks",]
+
+[package]
+name = "tool-executor"
+version = "0.10.0"
+edition = "2024"
+rust-version = "1.96"
+authors = [ "Bede Carroll <bedecarroll@users.noreply.github.com>",]
+description = "A thin, configurable launcher for AI code-assistant sessions"
+homepage = "https://github.com/bedecarroll/tool-executor"
+repository = "https://github.com/bedecarroll/tool-executor"
+license = "MIT"
+readme = "README.md"
+keywords = [ "cli",]
+categories = [ "command-line-utilities",]
+default-run = "tx-dev"
+
+[features]
+default = []
+benchmarks = []
+
+[workspace]
+members = [ "crates/tx",]
+
+[dependencies]
+blake3 = "1.8"
+bytemuck = "1.24"
+clap_complete = "4.6.5"
+clap_mangen = "0.3.0"
+color-eyre = "0.6"
+crossterm = "0.29"
+directories = "6.0.0"
+humantime = "2.3"
+itertools = "0.15"
+regex = "1.12"
+serde_json = "1.0"
+shellexpand = "3.1"
+shlex = "2.0"
+sqlite-vec = "=0.1.7-alpha.10"
+once_cell = "1.21"
+shell-escape = "0.1"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+ureq = { version = "3.3", features = ["json"] }
+walkdir = "2.5"
+which = "8.0"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+assert_fs = "1.1"
+predicates = "3.1.4"
+tempfile = "3.27"
+assert_cmd = "2.2"
+
+[dependencies.clap]
+version = "4.6.1"
+features = [ "derive",]
+
+[dependencies.indexmap]
+version = "2.14.0"
+features = [ "serde",]
+
+[dependencies.ratatui]
+version = "0.30"
+default-features = false
+features = [ "crossterm",]
+
+[dependencies.rusqlite]
+version = "0.40"
+features = [ "bundled", "modern_sqlite",]
+
+[dependencies.serde]
+version = "1.0"
+features = [ "derive",]
+
+[dependencies.tui-markdown]
+version = "0.3.7"
+default-features = true
+
+[dependencies.schemars]
+version = "1.2"
+features = [ "derive", "indexmap2",]
+
+[dependencies.time]
+version = "0.3"
+features = [ "formatting", "local-offset", "macros", "parsing",]
+
+[dependencies.toml]
+version = "1.1.2"
+features = [ "preserve_order",]
+
+[dependencies.tracing-subscriber]
+version = "0.3.23"
+features = [ "env-filter", "fmt",]
+
+[dependencies.self_update]
+version = "0.44.0"
+default-features = false
+features = [ "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "rustls", "ureq",]
+
+[dev-dependencies.insta]
+version = "1.47.2"
+features = [ "filters",]
+
+[dev-dependencies.criterion]
+version = "0.8.2"
+
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[package.metadata.dist]
+dist = false
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.30.3"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+packages = [ "tx",]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"

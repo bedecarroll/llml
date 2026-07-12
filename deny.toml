@@ -1,0 +1,61 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+  # yaml-rust and bincode 1.x unmaintained, via syntect <- tui-markdown
+  "RUSTSEC-2024-0320",
+  "RUSTSEC-2025-0141",
+  # quick-xml DoS advisories reachable only via self_update's pinned 0.37 line;
+  # fix requires quick-xml >=0.41, blocked on a self_update release
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "CDLA-Permissive-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+  "0BSD",
+  "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+skip = [
+  { name = "getrandom", version = "=0.2.16" },
+  { name = "windows-sys", version = "=0.52.0" },
+  { name = "windows-sys", version = "=0.59.0" },
+  { name = "windows-sys", version = "=0.60.2" },
+  { name = "windows-sys", version = "=0.61.2" },
+  { name = "windows_x86_64_msvc", version = "=0.52.6" },
+  { name = "windows_x86_64_msvc", version = "=0.53.1" },
+  { name = "windows-targets", version = "=0.52.6" },
+  { name = "windows-targets", version = "=0.53.5" },
+  { name = "windows_aarch64_gnullvm", version = "=0.52.6" },
+  { name = "windows_aarch64_gnullvm", version = "=0.53.1" },
+  { name = "windows_x86_64_gnullvm", version = "=0.52.6" },
+  { name = "windows_x86_64_gnullvm", version = "=0.53.1" },
+  { name = "windows_aarch64_msvc", version = "=0.52.6" },
+  { name = "windows_aarch64_msvc", version = "=0.53.1" },
+  { name = "windows_i686_gnu", version = "=0.52.6" },
+  { name = "windows_i686_gnu", version = "=0.53.1" },
+  { name = "windows_x86_64_gnu", version = "=0.52.6" },
+  { name = "windows_x86_64_gnu", version = "=0.53.1" },
+  { name = "windows_i686_gnullvm", version = "=0.52.6" },
+  { name = "windows_i686_gnullvm", version = "=0.53.1" },
+  { name = "windows_i686_msvc", version = "=0.52.6" },
+  { name = "windows_i686_msvc", version = "=0.53.1" },
+  { name = "quick-xml", version = "=0.37.5" },
+  { name = "itertools", version = "=0.13.0" },
+  { name = "itertools", version = "=0.14.0" },
+  { name = "webpki-roots", version = "=0.26.11" },
+  { name = "webpki-roots", version = "=1.0.4" },
+]
