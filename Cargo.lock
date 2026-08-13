@@ -247,9 +247,9 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "blake3"
-version = "1.8.5"
+version = "1.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+checksum = "76ae7bad254120e9e4c63bafc385310756f90c484eac0e36b8317cf09cb92a77"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -443,9 +443,9 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clap_mangen"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d82842b45bf9f6a3be090dd860095ac30728042c08e0d6261ca7259b5d850f07"
+checksum = "64f383fe92a826d3b1a3c18e0cb791bef22948931b4909f6781adea466ede5e8"
 dependencies = [
  "clap",
  "roff",
@@ -2580,9 +2580,9 @@ dependencies = [
 
 [[package]]
 name = "roff"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbf2048e0e979efb2ca7b91c4f1a8d77c91853e9b987c94c555668a8994915ad"
+checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
 
 [[package]]
 name = "rsqlite-vfs"
