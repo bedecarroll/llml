@@ -130,6 +130,7 @@ windows-archive = ".zip"
 cargo-dist-version = "0.30.3"
 # CI backends to support
 ci = "github"
+pr-run-mode = "skip"
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
