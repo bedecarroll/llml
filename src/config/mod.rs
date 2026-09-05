@@ -258,9 +258,7 @@ fn ensure_default_layout(dirs: &AppDirectories) -> Result<()> {
         return Ok(());
     }
 
-    let contents = default_config_contents(dirs);
-
-    fs::write(&main, contents).with_context(|| {
+    fs::write(&main, default_template()).with_context(|| {
         format!(
             "failed to write default configuration to {}",
             main.display()
@@ -270,20 +268,10 @@ fn ensure_default_layout(dirs: &AppDirectories) -> Result<()> {
     Ok(())
 }
 
-fn default_config_contents(_dirs: &AppDirectories) -> String {
-    DEFAULT_CONFIG_TEMPLATE.to_string()
-}
-
 /// Return the bundled default configuration template.
 #[must_use]
 pub fn default_template() -> &'static str {
     DEFAULT_CONFIG_TEMPLATE
-}
-
-/// Render the bundled default configuration using resolved application directories.
-#[must_use]
-pub fn bundled_default_config(dirs: &AppDirectories) -> String {
-    default_config_contents(dirs)
 }
 
 /// Generate the JSON Schema for the configuration file format.
@@ -852,20 +840,6 @@ list = \"value\"
     fn default_template_contains_provider() {
         let template = default_template();
         assert!(template.contains("provider = \"codex\""));
-    }
-
-    #[test]
-    fn bundled_default_config_renders_template() -> Result<()> {
-        let temp = TempDir::new()?;
-        let dirs = AppDirectories {
-            config_dir: temp.child("config").path().to_path_buf(),
-            data_dir: temp.child("data").path().to_path_buf(),
-            cache_dir: temp.child("cache").path().to_path_buf(),
-        };
-
-        let rendered = bundled_default_config(&dirs);
-        assert!(rendered.contains("provider = \"codex\""));
-        Ok(())
     }
 
     #[test]

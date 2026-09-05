@@ -71,10 +71,6 @@ fn assert_isolated_test_db_path(path: &Path) -> Result<()> {
 }
 
 fn is_test_harness_process() -> bool {
-    // Bazel test runners always set TEST_SRCDIR.
-    if std::env::var_os("TEST_SRCDIR").is_some() {
-        return true;
-    }
     std::env::current_exe()
         .ok()
         .and_then(|path| {

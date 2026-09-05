@@ -70,7 +70,7 @@ pub fn run<'a>(ctx: &'a mut UiContext<'a>) -> Result<()> {
     terminal.clear()?;
 
     let mut events = CrosstermEvents;
-    let outcome = run_with_terminal(ctx, &mut terminal, &mut events);
+    let outcome = run_app(ctx, &mut terminal, &mut events);
 
     disable_raw_mode()?;
     terminal
@@ -92,7 +92,7 @@ pub fn run<'a>(ctx: &'a mut UiContext<'a>) -> Result<()> {
         KeyCode::Esc,
         KeyModifiers::NONE,
     ))]);
-    let outcome = run_with_terminal(ctx, &mut terminal, &mut events)?;
+    let outcome = run_app(ctx, &mut terminal, &mut events)?;
     dispatch_outcome(outcome)
 }
 
@@ -168,19 +168,6 @@ where
             return Ok(state.outcome);
         }
     }
-}
-
-fn run_with_terminal<'a, B, E>(
-    ctx: &'a mut UiContext<'a>,
-    terminal: &mut Terminal<B>,
-    events: &mut E,
-) -> Result<Option<Outcome>>
-where
-    B: ratatui::backend::Backend,
-    B::Error: std::error::Error + Send + Sync + 'static,
-    E: EventSource,
-{
-    run_app(ctx, terminal, events)
 }
 
 fn dispatch_outcome(outcome: Option<Outcome>) -> Result<()> {
@@ -742,10 +729,6 @@ impl<'ctx> AppState<'ctx> {
             .unwrap_or_else(|| DEFAULT_STATUS_HINT.to_string())
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        self.handle_key_normal(key)
-    }
-
     #[allow(clippy::too_many_lines)]
     fn load_profiles(&mut self) {
         self.profiles.clear();
@@ -1048,7 +1031,7 @@ impl<'ctx> AppState<'ctx> {
         Ok(sessions)
     }
 
-    fn handle_key_normal(&mut self, key: KeyEvent) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => Ok(true),
             (KeyCode::Char('y' | 'Y'), mods) if mods.contains(KeyModifiers::CONTROL) => {

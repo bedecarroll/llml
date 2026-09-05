@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- markdownlint-disable-next-line MD024 -->
 ### Breaking
 
-- Nothing yet.
+- Removed the Rust helper `config::bundled_default_config`. Use `config::default_template()` instead, with `.to_owned()` if an owned string is required.
 
 <!-- markdownlint-disable-next-line MD024 -->
 ### Added
@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- markdownlint-disable-next-line MD024 -->
 ### Changed
 
-- Nothing yet.
+- Simplified default configuration output and TUI event handling by removing forwarding helpers. `tx config default --raw` remains accepted and prints the same bundled template as `tx config default`.
+- Removed obsolete Bazel test-runner detection and isolated CLI bootstrap and schema tests from the developer's Codex history.
 
 <!-- markdownlint-disable-next-line MD024 -->
 ### Fixed

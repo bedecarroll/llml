@@ -2056,12 +2056,8 @@ fn config_output_helpers_propagate_writer_errors() -> Result<()> {
         fail_on_write: true,
         fail_on_flush: false,
     };
-    let err = write_config_default(
-        &mut failing_write,
-        &ConfigDefaultCommand { raw: false },
-        &app.loaded,
-    )
-    .expect_err("default writer error should surface");
+    let err =
+        write_config_default(&mut failing_write).expect_err("default writer error should surface");
     assert!(err.to_string().contains("write failed"));
 
     let mut failing_write = FailingWriter {

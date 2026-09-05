@@ -1132,7 +1132,7 @@ fn empty_entry_for_state_variants() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn handle_key_normal_enter_executes_plan() -> Result<()> {
+fn handle_key_enter_executes_plan() -> Result<()> {
     let temp = TempDir::new()?;
     let mut config = build_config(temp.path());
     let directories = build_directories(&temp);
@@ -1175,7 +1175,7 @@ fn handle_key_normal_enter_executes_plan() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn handle_key_normal_ctrl_tab_emits_plan() -> Result<()> {
+fn handle_key_ctrl_tab_emits_plan() -> Result<()> {
     let temp = TempDir::new()?;
     let mut config = build_config(temp.path());
     let directories = build_directories(&temp);
@@ -1310,7 +1310,7 @@ fn selection_fallbacks_show_status_when_no_session_selected() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn handle_key_normal_covers_backspace_toggle_and_default_branch() -> Result<()> {
+fn handle_key_covers_backspace_toggle_and_default_branch() -> Result<()> {
     let temp = TempDir::new()?;
     let config = build_config(temp.path());
     let directories = build_directories(&temp);
@@ -1880,7 +1880,7 @@ fn reindex_updates_message_and_refreshes_entries() -> Result<()> {
 }
 
 #[test]
-fn run_with_terminal_emits_plan() -> Result<()> {
+fn run_app_emits_plan() -> Result<()> {
     let temp = TempDir::new()?;
     let mut config = build_config(temp.path());
     let directories = build_directories(&temp);
@@ -1897,7 +1897,7 @@ fn run_with_terminal_emits_plan() -> Result<()> {
         KeyCode::Tab,
         KeyModifiers::NONE,
     ))]);
-    let outcome = run_with_terminal(&mut ctx, &mut terminal, &mut events)?;
+    let outcome = run_app(&mut ctx, &mut terminal, &mut events)?;
     match outcome {
         Some(Outcome::Emit(plan)) => assert!(!plan.display.is_empty()),
         other => panic!("expected emit outcome, got {other:?}"),

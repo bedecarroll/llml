@@ -235,7 +235,7 @@ pub enum ConfigCommand {
 
 #[derive(Debug, Args)]
 pub struct ConfigDefaultCommand {
-    /// Show the raw bundled template without resolving runtime paths.
+    /// Accepted for compatibility; output is always the bundled template.
     #[arg(long, action = ArgAction::SetTrue)]
     pub raw: bool,
 }

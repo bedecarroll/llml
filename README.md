@@ -67,7 +67,7 @@ The repository pins Rust 1.90 in `rust-toolchain.toml`, so `cargo` automatically
 ### First run walkthrough
 
 1. Run `tx doctor` to create the configuration directory and confirm your environment.
-2. Inspect the bundled template with `tx config default --raw` and copy the parts you need into `~/.config/tx/config.toml`.
+2. Inspect the bundled template with `tx config default` and copy the parts you need into `~/.config/tx/config.toml`.
 3. Add a provider definition, for example:
 
    ```toml
@@ -150,7 +150,7 @@ $ tx config list
 $ tx config dump
 $ tx config where
 $ tx config lint
-$ tx config default --raw > ~/.config/tx/config.toml
+$ tx config default > ~/.config/tx/config.toml
 
 # Diagnostics
 $ tx doctor
@@ -162,6 +162,8 @@ $ tx export <session-id> > notes.md
 ## Configuration essentials
 
 Configuration lives under `~/.config/tx/` (or a custom directory via `--config-dir` or `TX_CONFIG_DIR`). Profiles reference providers, snippets, and wrappers so pipelines stay declarative. Use virtual profiles to surface external prompt catalogs alongside local definitions, and rerun `tx config lint` whenever you update configuration to catch missing dependencies.
+
+`tx config default` prints the bundled template verbatim. The `--raw` flag remains accepted for compatibility and produces the same output.
 
 ## Developer guide
 

@@ -17,9 +17,9 @@ use tracing::debug;
 use which::which;
 
 use crate::cli::{
-    Cli, ConfigCommand, ConfigDefaultCommand, ConfigSchemaCommand, ExportCommand,
-    InternalPromptAssemblerCommand, RagCommand, RagIndexCommand, RagSearchCommand, ResumeCommand,
-    SearchCommand, SelfUpdateCommand, StatsCommand,
+    Cli, ConfigCommand, ConfigSchemaCommand, ExportCommand, InternalPromptAssemblerCommand,
+    RagCommand, RagIndexCommand, RagSearchCommand, ResumeCommand, SearchCommand, SelfUpdateCommand,
+    StatsCommand,
 };
 use crate::commands::stats;
 use crate::config::model::{DiagnosticLevel, PromptAssemblerConfig};
@@ -549,7 +549,7 @@ impl<'cli> App<'cli> {
                 Ok(())
             }
             ConfigCommand::Lint => self.config_lint(),
-            ConfigCommand::Default(cmd) => self.config_default(cmd),
+            ConfigCommand::Default(_) => Self::config_default(),
             ConfigCommand::Schema(cmd) => Self::config_schema(cmd),
         }
     }
@@ -632,9 +632,9 @@ impl<'cli> App<'cli> {
     /// # Errors
     ///
     /// Returns an error if writing to stdout fails.
-    fn config_default(&self, cmd: &ConfigDefaultCommand) -> Result<()> {
+    fn config_default() -> Result<()> {
         let mut stdout = io::stdout().lock();
-        write_config_default(&mut stdout, cmd, &self.loaded)
+        write_config_default(&mut stdout)
     }
 
     fn config_schema(cmd: &ConfigSchemaCommand) -> Result<()> {
@@ -746,17 +746,8 @@ fn emit_command_with_writer<W: Write>(
     Ok(())
 }
 
-fn write_config_default<W: Write>(
-    writer: &mut W,
-    cmd: &ConfigDefaultCommand,
-    loaded: &LoadedConfig,
-) -> Result<()> {
-    let rendered = if cmd.raw {
-        crate::config::default_template().to_string()
-    } else {
-        crate::config::bundled_default_config(&loaded.directories)
-    };
-    writer.write_all(rendered.as_bytes())?;
+fn write_config_default<W: Write>(writer: &mut W) -> Result<()> {
+    writer.write_all(crate::config::default_template().as_bytes())?;
     writer.flush()?;
     Ok(())
 }

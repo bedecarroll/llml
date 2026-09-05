@@ -234,23 +234,21 @@ mod tests {
     fn run_executes_config_where_command() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp = TempDir::new().expect("temp dir");
+        let _home_guard = EnvOverride::set_path("HOME", temp.path());
+        let _profile_guard = EnvOverride::set_path("USERPROFILE", temp.path());
+        let _codex_guard = EnvOverride::set_path("CODEX_HOME", temp.path());
         let config_dir = temp.child("config");
         config_dir.create_dir_all().expect("create config dir");
-        let sessions_dir = config_dir.child("sessions");
-        sessions_dir.create_dir_all().expect("create sessions dir");
-        let config_toml = format!(
-            r#"
+        config_dir
+            .child("config.toml")
+            .write_str(
+                r#"
 provider = "codex"
 
 [providers.codex]
 bin = "echo"
-session_roots = ["{root}"]
-        "#,
-            root = toml_path(sessions_dir.path()),
-        );
-        config_dir
-            .child("config.toml")
-            .write_str(&config_toml)
+                "#,
+            )
             .expect("write config");
 
         let data_dir = temp.child("data");
@@ -275,23 +273,21 @@ session_roots = ["{root}"]
     fn run_invokes_ui_when_no_command() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp = TempDir::new().expect("temp dir");
+        let _home_guard = EnvOverride::set_path("HOME", temp.path());
+        let _profile_guard = EnvOverride::set_path("USERPROFILE", temp.path());
+        let _codex_guard = EnvOverride::set_path("CODEX_HOME", temp.path());
         let config_dir = temp.child("config");
         config_dir.create_dir_all().expect("create config dir");
-        let sessions_dir = config_dir.child("sessions");
-        sessions_dir.create_dir_all().expect("create sessions dir");
-        let config_toml = format!(
-            r#"
+        config_dir
+            .child("config.toml")
+            .write_str(
+                r#"
 provider = "codex"
 
 [providers.codex]
 bin = "echo"
-session_roots = ["{root}"]
-        "#,
-            root = toml_path(sessions_dir.path()),
-        );
-        config_dir
-            .child("config.toml")
-            .write_str(&config_toml)
+                "#,
+            )
             .expect("write config");
 
         let data_dir = temp.child("data");
@@ -316,23 +312,21 @@ session_roots = ["{root}"]
     fn run_executes_self_update_command() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp = TempDir::new().expect("temp dir");
+        let _home_guard = EnvOverride::set_path("HOME", temp.path());
+        let _profile_guard = EnvOverride::set_path("USERPROFILE", temp.path());
+        let _codex_guard = EnvOverride::set_path("CODEX_HOME", temp.path());
         let config_dir = temp.child("config");
         config_dir.create_dir_all().expect("create config dir");
-        let sessions_dir = config_dir.child("sessions");
-        sessions_dir.create_dir_all().expect("create sessions dir");
-        let config_toml = format!(
-            r#"
+        config_dir
+            .child("config.toml")
+            .write_str(
+                r#"
 provider = "codex"
 
 [providers.codex]
 bin = "echo"
-session_roots = ["{root}"]
-        "#,
-            root = toml_path(sessions_dir.path()),
-        );
-        config_dir
-            .child("config.toml")
-            .write_str(&config_toml)
+                "#,
+            )
             .expect("write config");
 
         let data_dir = temp.child("data");
